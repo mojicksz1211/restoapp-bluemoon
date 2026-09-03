@@ -1,0 +1,63 @@
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+build/
+.gradle/
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android/iOS/Gradle
+android/.gradle/
+android/local.properties
+app/.gradle/
+app/build/
+app/local.properties
+local.properties
+ios/Flutter/ephemeral/
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/App.framework
+ios/Flutter/Flutter.podspec
+ios/Flutter/Generated.xcconfig
+ios/Flutter/ephemeral/
+ios/Flutter/.last_build_id
+ios/Flutter/.flutter-plugins
+ios/Flutter/.flutter-plugins-dependencies
+ios/Runner/GeneratedPluginRegistrant.*
+ios/Runner/Flutter/Generated.xcconfig
+ios/Runner/Flutter/GeneratedPluginRegistrant.*
+ios/Runner/GeneratedPluginRegistrant.*
+ios/Runner/Flutter/Debug.xcconfig
+ios/Runner/Flutter/Release.xcconfig
+
+# Web
+web/.dart_tool/
+
+# Linux/Windows/macOS build
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+macos/Flutter/ephemeral/
+
+# Logs
+*.log
+
+# FVM Version Cache
+.fvm/
+
+# Node
+node_modules/
+package-lock.json
+
+# APKs
+*.apk
+*.aab

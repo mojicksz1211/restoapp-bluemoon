@@ -1,0 +1,9 @@
+{
+  "name": "restapp-bluemoon",
+  "version": "1.0.0",
+  "scripts": {
+    "serve": "python -m http.server 8080 --directory build/web --bind 0.0.0.0",
+    "build:web": "flutter build web --release",
+    "start": "flutter build web --release && python -m http.server 8080 --directory build/web --bind 0.0.0.0"
+  }
+}

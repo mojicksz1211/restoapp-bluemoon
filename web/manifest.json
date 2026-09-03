@@ -1,0 +1,35 @@
+{
+    "name": "Blue Moon Staff App",
+    "short_name": "Blue Moon",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#F5F6F0",
+    "theme_color": "#0C0D2D",
+    "description": "Blue Moon Family KTV / Dining Pub — staff app (waiter, cashier, kitchen, menu).",
+    "orientation": "portrait-primary",
+    "prefer_related_applications": false,
+    "icons": [
+        {
+            "src": "icons/Icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-maskable-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "icons/Icon-maskable-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}

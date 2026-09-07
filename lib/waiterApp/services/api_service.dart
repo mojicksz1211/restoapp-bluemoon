@@ -397,11 +397,16 @@ class ApiService {
     }
   }
 
-  // Update order status (pending/confirmed)
+  // Update order status (pending/confirmed/settled)
   static Future<Map<String, dynamic>> updateWaiterOrderStatus({
     required int orderId,
     required int status,
     String? paymentMethod,
+    double? discountAmount,
+    double? grandTotal,
+    double? amountPaid,
+    String? paymentRef,
+    String? remarks,
   }) async {
     try {
       final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/status');
@@ -413,6 +418,11 @@ class ApiService {
         body: jsonEncode({
           'status': status,
           if (paymentMethod != null) 'payment_method': paymentMethod,
+          if (discountAmount != null) 'discount_amount': discountAmount,
+          if (grandTotal != null) 'grand_total': grandTotal,
+          if (amountPaid != null) 'amount_paid': amountPaid,
+          if (paymentRef != null) 'payment_ref': paymentRef,
+          if (remarks != null) 'remarks': remarks,
         }),
       );
 

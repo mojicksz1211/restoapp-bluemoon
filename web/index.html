@@ -33,6 +33,143 @@
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
+  <script>
+    // Web Audio API POS Notification Chime
+    let _posAudioCtx = null;
+
+    function _getPosAudioContext() {
+      if (!_posAudioCtx) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (AudioContext) {
+          _posAudioCtx = new AudioContext();
+        }
+      }
+      if (_posAudioCtx && _posAudioCtx.state === 'suspended') {
+        _posAudioCtx.resume();
+      }
+      return _posAudioCtx;
+    }
+
+    // Auto-resume audio context on first user click anywhere
+    window.addEventListener('click', function() {
+      _getPosAudioContext();
+    }, { once: false, passive: true });
+
+    window.playPosNotificationSound = function() {
+      try {
+        const ctx = _getPosAudioContext();
+        if (!ctx) return;
+
+        const now = ctx.currentTime;
+
+        // Tone 1: 880Hz (A5 bell)
+        const osc1 = ctx.createOscillator();
+        const gain1 = ctx.createGain();
+        osc1.type = 'sine';
+        osc1.frequency.setValueAtTime(880, now);
+        gain1.gain.setValueAtTime(0.28, now);
+        gain1.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+        osc1.connect(gain1);
+        gain1.connect(ctx.destination);
+        osc1.start(now);
+        osc1.stop(now + 0.5);
+
+        // Tone 2: 1320Hz (E6 bright ring)
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.type = 'sine';
+        osc2.frequency.setValueAtTime(1320, now + 0.1);
+        gain2.gain.setValueAtTime(0.32, now + 0.1);
+        gain2.gain.exponentialRampToValueAtTime(0.0001, now + 0.7);
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.start(now + 0.1);
+        osc2.stop(now + 0.7);
+      } catch (err) {
+        console.warn('Could not play POS sound:', err);
+      }
+    };
+
+    // Text-To-Speech (TTS) Voice Announcements & Repeating Loop
+    let _alertActive = false;
+    let _alertTimeout = null;
+    let _activeSpeechText = '';
+
+    if (window.speechSynthesis && window.speechSynthesis.onvoiceschanged !== undefined) {
+      window.speechSynthesis.onvoiceschanged = () => {
+        window.speechSynthesis.getVoices();
+      };
+    }
+
+    window.speakOrderAnnouncement = function(text) {
+      try {
+        if (!window.speechSynthesis) return;
+        window.speechSynthesis.cancel();
+
+        // Play chime first
+        if (window.playPosNotificationSound) {
+          window.playPosNotificationSound();
+        }
+
+        // Slight 320ms delay so chime rings cleanly first
+        setTimeout(() => {
+          try {
+            if (!_alertActive || _activeSpeechText !== text) return;
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 0.95;
+            utterance.pitch = 1.05;
+            utterance.lang = 'en-US';
+
+            const voices = window.speechSynthesis.getVoices();
+            const engVoice = voices.find(v => v.lang && v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Online') || v.name.includes('Samantha') || v.name.includes('Zira') || v.name.includes('David')));
+            if (engVoice) utterance.voice = engVoice;
+
+            utterance.onend = function() {
+              if (_alertActive && _activeSpeechText === text) {
+                _alertTimeout = setTimeout(() => {
+                  window.speakOrderAnnouncement(text);
+                }, 3500);
+              }
+            };
+            utterance.onerror = function() {
+              if (_alertActive && _activeSpeechText === text) {
+                _alertTimeout = setTimeout(() => {
+                  window.speakOrderAnnouncement(text);
+                }, 4000);
+              }
+            };
+
+            window.speechSynthesis.speak(utterance);
+          } catch (e) {
+            console.warn('Speech error:', e);
+          }
+        }, 320);
+      } catch (e) {
+        console.warn('Speech error:', e);
+      }
+    };
+
+    window.startRepeatingOrderAlert = function(text, intervalMs) {
+      window.stopOrderAlert();
+      _alertActive = true;
+      _activeSpeechText = text;
+      window.speakOrderAnnouncement(text);
+    };
+
+    window.stopOrderAlert = function() {
+      _alertActive = false;
+      _activeSpeechText = '';
+      if (_alertTimeout) {
+        clearTimeout(_alertTimeout);
+        _alertTimeout = null;
+      }
+      try {
+        if (window.speechSynthesis) {
+          window.speechSynthesis.cancel();
+        }
+      } catch (e) {}
+    };
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

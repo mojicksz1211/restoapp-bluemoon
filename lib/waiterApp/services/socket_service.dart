@@ -6,6 +6,9 @@ class SocketService {
   static IO.Socket? _socket;
   static bool _isConnected = false;
   static final Set<int> _desiredOrderRooms = <int>{};
+  static bool _shouldBeInCashier = false;
+  static bool _shouldBeInWaiter = false;
+  static bool _shouldBeInKitchen = false;
 
   // Get socket instance
   static IO.Socket? get socket => _socket;
@@ -46,6 +49,21 @@ class SocketService {
       _socket!.onConnect((_) {
         _isConnected = true;
         debugPrint('[SOCKET] Connected: ${_socket!.id}');
+
+        // Re-join role rooms after (re)connect
+        if (_shouldBeInCashier) {
+          _socket!.emit('join_cashier');
+          debugPrint('[SOCKET] Re-joined cashier room');
+        }
+        if (_shouldBeInWaiter) {
+          _socket!.emit('join_waiter');
+          debugPrint('[SOCKET] Re-joined waiter room');
+        }
+        if (_shouldBeInKitchen) {
+          _socket!.emit('join_kitchen');
+          debugPrint('[SOCKET] Re-joined kitchen room');
+        }
+
         // Re-join desired rooms after (re)connect.
         for (final orderId in _desiredOrderRooms) {
           _socket!.emit('join_order', orderId);
@@ -73,6 +91,69 @@ class SocketService {
       debugPrint('[SOCKET] Initialization error: $e');
       _isConnected = false;
     }
+  }
+
+  // Join cashier room
+  static void joinCashier() {
+    _shouldBeInCashier = true;
+    if (_socket == null) {
+      initialize();
+      return;
+    }
+    if (_isConnected) {
+      _socket!.emit('join_cashier');
+      debugPrint('[SOCKET] Joined cashier room');
+    }
+  }
+
+  // Leave cashier room
+  static void leaveCashier() {
+    _shouldBeInCashier = false;
+    if (_socket == null || !_isConnected) return;
+    _socket!.emit('leave_cashier');
+    debugPrint('[SOCKET] Left cashier room');
+  }
+
+  // Join waiter room
+  static void joinWaiter() {
+    _shouldBeInWaiter = true;
+    if (_socket == null) {
+      initialize();
+      return;
+    }
+    if (_isConnected) {
+      _socket!.emit('join_waiter');
+      debugPrint('[SOCKET] Joined waiter room');
+    }
+  }
+
+  // Leave waiter room
+  static void leaveWaiter() {
+    _shouldBeInWaiter = false;
+    if (_socket == null || !_isConnected) return;
+    _socket!.emit('leave_waiter');
+    debugPrint('[SOCKET] Left waiter room');
+  }
+
+  // Join kitchen room
+  static void joinKitchen() {
+    _shouldBeInKitchen = true;
+    if (_socket == null) {
+      initialize();
+      return;
+    }
+    if (_isConnected) {
+      _socket!.emit('join_kitchen');
+      debugPrint('[SOCKET] Joined kitchen room');
+    }
+  }
+
+  // Leave kitchen room
+  static void leaveKitchen() {
+    _shouldBeInKitchen = false;
+    if (_socket == null || !_isConnected) return;
+    _socket!.emit('leave_kitchen');
+    debugPrint('[SOCKET] Left kitchen room');
   }
 
   // Join order room

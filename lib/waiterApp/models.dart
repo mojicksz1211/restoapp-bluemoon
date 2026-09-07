@@ -149,7 +149,7 @@ class Order {
 
   Order({
     required this.id,
-    required this.items,
+    required List<CartItem> items,
     required this.totalPrice,
     required this.orderTime,
     this.status = OrderStatus.waitingForAssistance,
@@ -157,7 +157,49 @@ class Order {
     this.backendStatus,
     this.orderType,
     this.tableId,
-  });
+  }) : items = consolidateCartItems(items);
+
+  /// Consolidates duplicate cart items by menu ID or name, summing quantities and combining remarks.
+  static List<CartItem> consolidateCartItems(List<CartItem> rawItems) {
+    if (rawItems.length <= 1) return rawItems;
+    final List<CartItem> consolidated = [];
+
+    for (final cartItem in rawItems) {
+      final nameNorm = cartItem.item.name.trim().toLowerCase();
+      final hasMenuId = cartItem.item.id != null && cartItem.item.id! > 0;
+
+      final existingIndex = consolidated.indexWhere((existing) {
+        if (hasMenuId && existing.item.id != null && existing.item.id! > 0) {
+          if (existing.item.id == cartItem.item.id) return true;
+        }
+        if (nameNorm.isNotEmpty && existing.item.name.trim().toLowerCase() == nameNorm) {
+          return true;
+        }
+        return false;
+      });
+
+      if (existingIndex >= 0) {
+        final existing = consolidated[existingIndex];
+        final newQty = existing.quantity + cartItem.quantity;
+        String? combinedRemarks = existing.remarks;
+        if (cartItem.remarks != null && cartItem.remarks!.trim().isNotEmpty) {
+          if (combinedRemarks == null || combinedRemarks.trim().isEmpty) {
+            combinedRemarks = cartItem.remarks;
+          } else if (!combinedRemarks.toLowerCase().contains(cartItem.remarks!.trim().toLowerCase())) {
+            combinedRemarks = '$combinedRemarks, ${cartItem.remarks}';
+          }
+        }
+        consolidated[existingIndex] = CartItem(
+          item: existing.item,
+          quantity: newQty,
+          remarks: combinedRemarks,
+        );
+      } else {
+        consolidated.add(cartItem);
+      }
+    }
+    return consolidated;
+  }
 
   String get statusText {
     switch (status) {

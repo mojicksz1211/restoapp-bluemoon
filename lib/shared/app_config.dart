@@ -5,8 +5,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 class AppConfig {
   // Default URLs for different environments
   // NOTE: Dev URL uses the LAN IP so the app works on any device in the
-  // local network (localhost would resolve to the accessing device, not the server).
-  static const String _defaultProdUrl = 'http://localhost:2000';
   static const String _defaultDevUrl = 'http://192.168.110.44:2000';
   
   // Key for storing custom API URL in SharedPreferences

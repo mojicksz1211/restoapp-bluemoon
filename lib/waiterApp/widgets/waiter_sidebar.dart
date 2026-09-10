@@ -12,6 +12,8 @@ class WaiterSidebar extends StatelessWidget {
   // Opens the shared settings sheet (same one menuApp uses) — logout lives
   // inside that sheet now instead of being its own row here.
   final VoidCallback onOpenSettings;
+  // Manual data refresh — sits next to Settings at the bottom of the rail.
+  final VoidCallback onRefresh;
   final double width;
   // Notification badge counts, keyed by the same index as _items
   // (0: Tables, 1: New Orders, 2: Order List). A null/zero count hides the
@@ -32,6 +34,7 @@ class WaiterSidebar extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelect,
     required this.onOpenSettings,
+    required this.onRefresh,
     this.width = 280,
     this.newOrdersCount = 0,
     this.orderListCount = 0,
@@ -77,11 +80,12 @@ class WaiterSidebar extends StatelessWidget {
                 children: [
                   if (!isLandscape)
                     Text(
-                      'Waiter App',
+                      'WAITER DASHBOARD',
                       style: GoogleFonts.urbanist(
                         color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: isCompact ? 14 : 16,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 2,
+                        fontSize: isCompact ? 13 : 15,
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -145,6 +149,12 @@ class WaiterSidebar extends StatelessWidget {
               ],
             ],
             const Spacer(),
+            _NavRow(
+              icon: Icons.refresh,
+              label: 'Refresh',
+              isSelected: false,
+              onTap: onRefresh,
+            ),
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
               child: _NavRow(

@@ -3,15 +3,23 @@ class WaiterTable {
   final String number;
   final int capacity;
   final int status;
+  // Fixed charge for VIP / KTV rooms. 0 (or null in the DB) means this is a
+  // regular table with no room charge. When set, the backend merges it into
+  // the order's SERVICE_CHARGE (see orderModel.resolveServiceChargeWithRoomCharge).
+  final double roomCharge;
 
   WaiterTable({
     required this.id,
     required this.number,
     required this.capacity,
     required this.status,
+    this.roomCharge = 0,
   });
 
+  bool get hasRoomCharge => roomCharge > 0;
+
   factory WaiterTable.fromApi(Map<String, dynamic> data) {
+    final rawRoomCharge = data['room_charge'] ?? data['ROOM_CHARGE'];
     return WaiterTable(
       id: data['id'] is int ? data['id'] : (data['id'] as num?)?.toInt() ?? 0,
       number: data['table_number']?.toString() ?? '',
@@ -21,6 +29,9 @@ class WaiterTable {
       status: data['status'] is int
           ? data['status']
           : (data['status'] as num?)?.toInt() ?? 0,
+      roomCharge: rawRoomCharge is num
+          ? rawRoomCharge.toDouble()
+          : double.tryParse(rawRoomCharge?.toString() ?? '') ?? 0,
     );
   }
 }
@@ -30,6 +41,11 @@ class WaiterOrder {
   final String? orderNo;
   final int? tableId;
   final String? tableNumber;
+  // Base per-session room charge of this order's table (restaurant_tables.
+  // ROOM_CHARGE), 0 for regular tables. The backend merges one or more units
+  // of this into `serviceCharge`, so it lets the UI show the breakdown
+  // (e.g. ₱1,500 × 4) instead of a bare, surprising total.
+  final double roomCharge;
   final int status;
   final double grandTotal;
   // GRAND_TOTAL = SUBTOTAL (sum of items) + TAX_AMOUNT + SERVICE_CHARGE -
@@ -56,6 +72,7 @@ class WaiterOrder {
     required this.tableNumber,
     required this.status,
     required this.grandTotal,
+    this.roomCharge = 0,
     this.subtotal = 0,
     this.taxAmount = 0,
     this.serviceCharge = 0,
@@ -137,6 +154,7 @@ class WaiterOrder {
       orderNo: (data['order_no'] ?? data['orderNo'] ?? data['ORDER_NO'])?.toString(),
       tableId: rawTableId is int ? rawTableId : (rawTableId as num?)?.toInt() ?? int.tryParse(rawTableId?.toString() ?? ''),
       tableNumber: (data['table_number'] ?? data['tableNumber'] ?? data['TABLE_NUMBER'])?.toString(),
+      roomCharge: _parseDouble(data['room_charge'] ?? data['roomCharge'] ?? data['ROOM_CHARGE']),
       status: rawStatus is int ? rawStatus : (rawStatus as num?)?.toInt() ?? int.tryParse(rawStatus?.toString() ?? '') ?? 0,
       grandTotal: _parseDouble(data['grand_total'] ?? data['grandTotal'] ?? data['GRAND_TOTAL']),
       subtotal: _parseDouble(data['subtotal'] ?? data['SUBTOTAL']),
@@ -159,6 +177,7 @@ class WaiterOrder {
 
   WaiterOrder copyWith({
     int? status,
+    double? roomCharge,
     double? grandTotal,
     double? subtotal,
     double? taxAmount,
@@ -177,6 +196,7 @@ class WaiterOrder {
       orderNo: orderNo,
       tableId: tableId,
       tableNumber: tableNumber,
+      roomCharge: roomCharge ?? this.roomCharge,
       status: status ?? this.status,
       grandTotal: grandTotal ?? this.grandTotal,
       subtotal: subtotal ?? this.subtotal,

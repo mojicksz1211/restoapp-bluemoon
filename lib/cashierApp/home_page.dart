@@ -10,6 +10,7 @@ import '../shared/sound_service.dart';
 import '../shared/globals.dart';
 import '../waiterApp/pages/get_order_page.dart' as waiter_order;
 import 'widgets/bill_out_modal.dart';
+import '../waiterApp/widgets/transfer_table_modal.dart';
 import '../shared/settings_sheet.dart';
 import '../shared/app_translations.dart';
 
@@ -142,6 +143,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
   String _floorFilter = 'all'; // 'all', 'gf', '2f'
   final Set<int> _joinedOrderIds = {};
   String _searchQuery = '';
+  final TextEditingController _searchController = TextEditingController();
   final Set<int> _pinnedOrderIds = {};
   final Set<int> _unacknowledgedOrderIds = {};
   final List<WaiterOrder> _alertOrdersQueue = [];
@@ -150,6 +152,17 @@ class _CashierHomePageState extends State<CashierHomePage> {
   VoidCallback? _disposeOrderUpdated;
   VoidCallback? _disposeOrderItemsAdded;
   VoidCallback? _disposeOrderCreated;
+
+  // Socket events arrive in bursts (the backend re-broadcasts every order on
+  // connect and on any change). Coalesce the follow-up full refresh, guard
+  // against overlapping refreshes, and only raise "new order" alerts once the
+  // first load is done — otherwise the reconnect backlog floods the queue.
+  Timer? _socketRefreshTimer;
+  Timer? _pollTimer;
+  bool _isLoadingData = false;
+  bool _hasLoadedOrdersOnce = false;
+  final Set<int> _alertedOrderIds = {};
+  static const int _maxAlertQueue = 15;
 
   void _updateRepeatingTtsAnnouncement() {
     if (_alertOrdersQueue.isEmpty) {
@@ -234,6 +247,17 @@ class _CashierHomePageState extends State<CashierHomePage> {
     _loadData();
     _initializeSocket();
     languageNotifier.addListener(_onLanguageChanged);
+    // Belt-and-suspenders: socket_io_client has NO real HTTP-polling fallback
+    // on native platforms (io_transports.dart hardcodes WebSocketTransport
+    // regardless of the configured transport list) — so on a network that
+    // blocks WebSocket upgrades (common on corporate/hotel firewalls), the
+    // socket can never connect, full stop, no matter what the backend does.
+    // Poll REST fast enough to feel close to realtime on those networks; skip
+    // the extra fetch entirely once the socket is actually connected, since
+    // _scheduleSocketRefresh already keeps things in sync then.
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted && !SocketService.isConnected) _pollOrdersOnly();
+    });
   }
 
   void _onLanguageChanged() {
@@ -246,11 +270,18 @@ class _CashierHomePageState extends State<CashierHomePage> {
   void dispose() {
     SoundService.stopRepeatingAlert();
     languageNotifier.removeListener(_onLanguageChanged);
+    _socketRefreshTimer?.cancel();
+    _pollTimer?.cancel();
     _cleanupSocket();
+    _searchController.dispose();
     super.dispose();
   }
 
   Future<void> _loadData({bool showSpinner = true}) async {
+    // Never let socket-triggered background refreshes stack up.
+    if (_isLoadingData) return;
+    _isLoadingData = true;
+
     if (showSpinner) {
       setState(() {
         _isLoading = true;
@@ -285,17 +316,10 @@ class _CashierHomePageState extends State<CashierHomePage> {
           loadedMenu = List<Map<String, dynamic>>.from(menuResult['data']).map(MenuItem.fromApi).toList();
         }
 
-        setState(() {
-          _orders = ordersData.map(WaiterOrder.fromApi).toList();
+        _applyFreshOrders(ordersData, extra: () {
           _tables = loadedTables;
           _menuItems = loadedMenu;
           _isLoading = false;
-          for (int i = 0; i < _alertOrdersQueue.length; i++) {
-            final fresh = _orders.firstWhere((o) => o.id == _alertOrdersQueue[i].id, orElse: () => _alertOrdersQueue[i]);
-            if (fresh.items.isNotEmpty) {
-              _alertOrdersQueue[i] = fresh;
-            }
-          }
         });
         _syncSocketOrderRooms();
       } else {
@@ -310,6 +334,73 @@ class _CashierHomePageState extends State<CashierHomePage> {
         _isLoading = false;
       });
       debugPrint('❌ Error in _loadData: $e');
+    } finally {
+      _isLoadingData = false;
+    }
+  }
+
+  /// Lightweight poll for the fast (1s) fallback timer used when the socket
+  /// isn't connected: orders only, no tables/menu refetch, so that cadence
+  /// doesn't re-download the whole menu on every tick.
+  Future<void> _pollOrdersOnly() async {
+    if (_isLoadingData) return;
+    _isLoadingData = true;
+    try {
+      final ordersResult = await ApiService.getWaiterOrders();
+      if (ordersResult['unauthorized'] == true) {
+        await _redirectToLogin();
+        return;
+      }
+      if (ordersResult['success'] == true) {
+        final ordersData = List<Map<String, dynamic>>.from(ordersResult['data']);
+        _applyFreshOrders(ordersData);
+        _syncSocketOrderRooms();
+      }
+    } catch (e) {
+      debugPrint('❌ Error in _pollOrdersOnly: $e');
+    } finally {
+      _isLoadingData = false;
+    }
+  }
+
+  /// Shared by [_loadData] and [_pollOrdersOnly]: replaces [_orders], keeps
+  /// the alert queue's copies fresh, and raises the same alert / TTS / modal
+  /// for any order this fetch turns up that we didn't already know about —
+  /// the REST-poll equivalent of a missed `order_created` socket event.
+  /// [extra] runs inside the same setState for callers that also update other
+  /// fields (tables, menu, loading flag).
+  void _applyFreshOrders(List<Map<String, dynamic>> ordersData, {VoidCallback? extra}) {
+    final previousIds = _orders.map((o) => o.id).toSet();
+    final freshOrders = ordersData.map(WaiterOrder.fromApi).toList();
+    // Skip on the very first load (everything is "new" then) and skip
+    // settled orders (history, not something to alert about). Materialized
+    // eagerly (not left as a lazy Iterable) since the predicate has a side
+    // effect (_alertedOrderIds.add) that must run exactly once per order.
+    final newlyAppeared = _hasLoadedOrdersOnce
+        ? freshOrders
+            .where((o) => !previousIds.contains(o.id) && (o.status == 2 || o.status == 3))
+            .where((o) => _alertedOrderIds.add(o.id))
+            .toList()
+        : const <WaiterOrder>[];
+
+    setState(() {
+      _orders = freshOrders;
+      for (int i = 0; i < _alertOrdersQueue.length; i++) {
+        final fresh = _orders.firstWhere((o) => o.id == _alertOrdersQueue[i].id, orElse: () => _alertOrdersQueue[i]);
+        if (fresh.items.isNotEmpty) {
+          _alertOrdersQueue[i] = fresh;
+        }
+      }
+      for (final order in newlyAppeared) {
+        debugPrint('✓ Poll: new order ${order.id} (socket missed it)');
+        _unacknowledgedOrderIds.add(order.id);
+        _enqueueAlert(order, addedItems: false);
+      }
+      extra?.call();
+    });
+    _hasLoadedOrdersOnce = true;
+    if (newlyAppeared.isNotEmpty) {
+      _updateRepeatingTtsAnnouncement();
     }
   }
 
@@ -317,6 +408,29 @@ class _CashierHomePageState extends State<CashierHomePage> {
     await ApiService.logout();
     if (!mounted) return;
     refreshAppAuth();
+  }
+
+  /// Manual refresh — wired to the refresh button next to the settings/logout
+  /// action in the AppBar. Full reload, no blocking spinner, brief snackbar.
+  bool _isManualRefreshing = false;
+  Future<void> _manualRefresh() async {
+    if (_isManualRefreshing) return;
+    setState(() => _isManualRefreshing = true);
+    try {
+      await _loadData(showSpinner: false);
+    } finally {
+      if (mounted) setState(() => _isManualRefreshing = false);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: 1),
+          content: Text('Refreshed'),
+        ),
+      );
   }
 
   Future<void> _initializeSocket() async {
@@ -353,6 +467,13 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
     debugPrint('🔔 Socket event received ($eventType, isFullUpdate: $isFullUpdate): ${data.keys.toList()}');
 
+    // Ignore other branches' realtime traffic. The backend broadcasts to
+    // per-branch rooms, but stays a defensive check for shared-room fallback.
+    if (!_isForThisBranch(data)) {
+      debugPrint('↪︎ Socket event for another branch — ignored');
+      return;
+    }
+
     final rawOrderData = data['order'];
     final orderData = rawOrderData is Map
         ? Map<String, dynamic>.from(rawOrderData)
@@ -360,6 +481,17 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
     if (orderData['order_id'] == null && orderData['orderId'] != null) {
       orderData['order_id'] = orderData['orderId'];
+    }
+    // The socket payload carries the authoritative id at the top level
+    // (`{ order_id, order, timestamp }`); the nested `order` object may not
+    // repeat it. Fall back through the common key spellings.
+    orderData['order_id'] ??= data['order_id'] ??
+        orderData['id'] ??
+        orderData['ORDER_ID'] ??
+        orderData['ORDERID'] ??
+        data['orderId'];
+    if (orderData['order_no'] == null && data['order_no'] != null) {
+      orderData['order_no'] = data['order_no'];
     }
 
     final orderIdRaw = orderData['order_id'];
@@ -379,23 +511,34 @@ class _CashierHomePageState extends State<CashierHomePage> {
       final updatedOrder = WaiterOrder.fromApi(normalized);
 
 
-      // Queue order for alert and update repeating voice announcement
-      if (eventType == 'order_created' || isNewOrder) {
+      // Queue order for alert and update repeating voice announcement.
+      // A genuinely new order always arrives as an `order_created` event; an
+      // unknown order from `order_updated` is the reconnect backlog or another
+      // branch's traffic (the backend broadcasts globally), so it must not
+      // alert. Alert each order at most once.
+      if (eventType == 'order_created' && _alertedOrderIds.add(updatedOrder.id)) {
         setState(() {
           _unacknowledgedOrderIds.add(updatedOrder.id);
-          _alertOrdersQueue.removeWhere((o) => o.id == updatedOrder.id);
-          _alertOrdersQueue.add(updatedOrder);
-          _alertIsAddedItems = false;
+          _enqueueAlert(updatedOrder, addedItems: false);
         });
         _updateRepeatingTtsAnnouncement();
-      } else if (eventType == 'order_items_added' || data['items_added'] != null) {
+      } else if (!isNewOrder &&
+          (eventType == 'order_items_added' || data['items_added'] != null)) {
         setState(() {
           _unacknowledgedOrderIds.add(updatedOrder.id);
-          _alertOrdersQueue.removeWhere((o) => o.id == updatedOrder.id);
-          _alertOrdersQueue.add(updatedOrder);
-          _alertIsAddedItems = true;
+          _enqueueAlert(updatedOrder, addedItems: true);
         });
         _updateRepeatingTtsAnnouncement();
+      }
+
+      // An unknown order from a plain `order_updated` / `order_items_added` is
+      // almost always the reconnect backlog or another branch's traffic (the
+      // backend broadcasts globally). Don't splice it in — the debounced
+      // _loadData (branch-scoped) is the source of truth for which orders
+      // exist. Only `order_created` adds a new order locally.
+      if (existingIndex == -1 && eventType != 'order_created') {
+        _scheduleSocketRefresh();
+        return;
       }
 
       setState(() {
@@ -442,10 +585,44 @@ class _CashierHomePageState extends State<CashierHomePage> {
       });
       _syncSocketOrderRooms();
 
-      // Background refresh to guarantee 100% database sync for tables & totals
-      _loadData(showSpinner: false);
+      // Background refresh to guarantee DB sync for tables & totals — debounced
+      // so a burst of socket events triggers at most one refetch.
+      _scheduleSocketRefresh();
     } catch (e) {
       debugPrint('❌ Error updating order from socket: $e');
+    }
+  }
+
+  /// True unless the event clearly belongs to a different branch. Reads the
+  /// branch id from the top-level payload or the nested order object; when
+  /// neither is present (older backend) we can't tell, so we let it through.
+  bool _isForThisBranch(Map<String, dynamic> data) {
+    final myBranch = SocketService.branchId;
+    if (myBranch == null) return true;
+    final order = data['order'];
+    final raw = data['branch_id'] ??
+        data['branchId'] ??
+        (order is Map ? (order['branch_id'] ?? order['BRANCH_ID'] ?? order['branchId']) : null);
+    if (raw == null) return true;
+    final eventBranch = raw is int ? raw : int.tryParse(raw.toString());
+    return eventBranch == null || eventBranch == myBranch;
+  }
+
+  void _scheduleSocketRefresh() {
+    _socketRefreshTimer?.cancel();
+    _socketRefreshTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) _loadData(showSpinner: false);
+    });
+  }
+
+  /// Add/refresh an order in the alert queue, keeping it bounded so a burst of
+  /// events can't grow it without limit. Call inside setState.
+  void _enqueueAlert(WaiterOrder order, {required bool addedItems}) {
+    _alertIsAddedItems = addedItems;
+    _alertOrdersQueue.removeWhere((o) => o.id == order.id);
+    _alertOrdersQueue.add(order);
+    if (_alertOrdersQueue.length > _maxAlertQueue) {
+      _alertOrdersQueue.removeRange(0, _alertOrdersQueue.length - _maxAlertQueue);
     }
   }
 
@@ -732,6 +909,27 @@ class _CashierHomePageState extends State<CashierHomePage> {
               },
             ),
             Container(
+              margin: const EdgeInsets.only(right: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0C0E2B).withValues(alpha: 0.1),
+                shape: BoxShape.circle,
+              ),
+              child: IconButton(
+                tooltip: 'Refresh',
+                onPressed: _isManualRefreshing ? null : _manualRefresh,
+                icon: _isManualRefreshing
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Color(0xFF0C0E2B),
+                        ),
+                      )
+                    : const Icon(Icons.refresh, color: Color(0xFF0C0E2B), size: 20),
+              ),
+            ),
+            Container(
               margin: const EdgeInsets.only(right: 16),
               decoration: BoxDecoration(
                 color: const Color(0xFF0C0E2B).withValues(alpha: 0.1),
@@ -1002,6 +1200,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
   Widget _buildSearchTextField({bool isCompact = false}) {
     return TextField(
+      controller: _searchController,
       onChanged: (value) {
         setState(() {
           _searchQuery = value;
@@ -1021,7 +1220,11 @@ class _CashierHomePageState extends State<CashierHomePage> {
         ),
         suffixIcon: _searchQuery.isNotEmpty
             ? GestureDetector(
-                onTap: () => setState(() => _searchQuery = ''),
+                onTap: () {
+                  _searchController.clear();
+                  FocusScope.of(context).unfocus();
+                  setState(() => _searchQuery = '');
+                },
                 child: Icon(
                   Icons.clear_rounded,
                   color: Colors.grey.shade400,
@@ -2715,6 +2918,34 @@ class _AnimatedOrderCard extends StatefulWidget {
 class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
   bool _isHovered = false;
 
+  // Base per-session room-charge rate for this order's table. Used to break
+  // down the room-charge total on the card so the cashier/customer can see
+  // WHY it's ₱6,000 (e.g. ₱1,500 × 4) instead of being surprised by it once
+  // a waiter has extended the room charge one or more times. Comes on the
+  // order payload; falls back to the tables list if an older payload omits it.
+  double get _roomChargeRate {
+    if (widget.order.roomCharge > 0) return widget.order.roomCharge;
+    final tid = widget.order.tableId;
+    if (tid == null) return 0;
+    for (final t in widget.tables) {
+      if (t.id == tid) return t.roomCharge;
+    }
+    return 0;
+  }
+
+  // How many room-charge units the current service charge represents, when
+  // it divides evenly into the base rate; null when it doesn't (e.g. an
+  // extra manual service charge was mixed in) so we just show the total.
+  int? get _roomChargeUnits {
+    final rate = _roomChargeRate;
+    final total = widget.order.serviceCharge;
+    if (rate <= 0 || total <= 0) return null;
+    final q = total / rate;
+    final rounded = q.round();
+    if (rounded >= 1 && (q - rounded).abs() < 0.01) return rounded;
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     const primaryColor = Color(0xFF0C0E2B);
@@ -2996,49 +3227,100 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                       );
                     }),
                     if (widget.order.serviceCharge > 0)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 6),
-                        child: Row(
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
-                              decoration: BoxDecoration(
-                                color: const Color(0xFFD97706).withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                'ROOM',
-                                style: GoogleFonts.urbanist(
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w900,
-                                  color: const Color(0xFFD97706),
+                      Builder(
+                        builder: (context) {
+                          const gold = Color(0xFFD97706);
+                          final rate = _roomChargeRate;
+                          final units = _roomChargeUnits;
+                          final showBreakdown = rate > 0 && units != null && units >= 1;
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 6),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                                  decoration: BoxDecoration(
+                                    color: gold.withValues(alpha: 0.12),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    'ROOM',
+                                    style: GoogleFonts.urbanist(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w900,
+                                      color: gold,
+                                    ),
+                                  ),
                                 ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                'Room Charge',
-                                style: GoogleFonts.urbanist(
-                                  fontSize: 13.5,
-                                  fontWeight: FontWeight.w800,
-                                  color: const Color(0xFFD97706),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Flexible(
+                                            child: Text(
+                                              'Room Charge',
+                                              style: GoogleFonts.urbanist(
+                                                fontSize: 13.5,
+                                                fontWeight: FontWeight.w800,
+                                                color: gold,
+                                              ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ),
+                                          if (showBreakdown && units > 1) ...[
+                                            const SizedBox(width: 6),
+                                            Container(
+                                              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                              decoration: BoxDecoration(
+                                                color: gold.withValues(alpha: 0.14),
+                                                borderRadius: BorderRadius.circular(4),
+                                              ),
+                                              child: Text(
+                                                '×$units',
+                                                style: GoogleFonts.urbanist(
+                                                  fontSize: 11,
+                                                  fontWeight: FontWeight.w900,
+                                                  color: gold,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                      if (showBreakdown)
+                                        Text(
+                                          units > 1
+                                              ? 'Base ₱${formatPrice(rate)} + ${units - 1} extension${units - 1 == 1 ? '' : 's'} (₱${formatPrice(rate)} × $units)'
+                                              : 'Base rate ₱${formatPrice(rate)}',
+                                          style: GoogleFonts.urbanist(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                            color: Colors.grey.shade500,
+                                          ),
+                                          maxLines: 2,
+                                        ),
+                                    ],
+                                  ),
                                 ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  '₱${formatPrice(widget.order.serviceCharge)}',
+                                  style: GoogleFonts.urbanist(
+                                    fontSize: 13.5,
+                                    fontWeight: FontWeight.w800,
+                                    color: gold,
+                                  ),
+                                ),
+                              ],
                             ),
-                            const SizedBox(width: 8),
-                            Text(
-                              '₱${formatPrice(widget.order.serviceCharge)}',
-                              style: GoogleFonts.urbanist(
-                                fontSize: 13.5,
-                                fontWeight: FontWeight.w800,
-                                color: const Color(0xFFD97706),
-                              ),
-                            ),
-                          ],
-                        ),
+                          );
+                        },
                       ),
                     if (remainingCount > 0)
                       InkWell(
@@ -3127,6 +3409,41 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                     const SizedBox(height: 10),
                     Row(
                       children: [
+                        // Transfer Table (Lipat Mesa)
+                        if (widget.order.tableId != null) ...[
+                          SizedBox(
+                            height: 36,
+                            width: 36,
+                            child: OutlinedButton(
+                              onPressed: () async {
+                                final rawName = (widget.order.tableNumber ?? '').trim();
+                                final currentName = rawName.isEmpty
+                                    ? (widget.order.orderType ?? 'Dine-In')
+                                    : (rawName.toLowerCase().startsWith('table')
+                                        ? rawName
+                                        : 'Table $rawName');
+                                final transferred = await showTransferTableModal(
+                                  context: context,
+                                  orderId: widget.order.id,
+                                  currentTableName: currentName,
+                                  currentTableId: widget.order.tableId,
+                                  allTables: widget.tables,
+                                );
+                                if (transferred == true && mounted) {
+                                  await widget.onRefresh();
+                                }
+                              },
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: primaryColor,
+                                side: BorderSide(color: Colors.grey.shade300),
+                                padding: EdgeInsets.zero,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                              ),
+                              child: const Icon(Icons.swap_horiz_rounded, size: 18),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                        ],
                         // Bill Out
                         Expanded(
                           flex: 1,
@@ -3149,6 +3466,8 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                               icon: const Icon(Icons.receipt_long_outlined, size: 14),
                               label: Text(
                                 'Bill Out',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 12),
                               ),
                             ),
@@ -3193,7 +3512,9 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                               ),
                               icon: const Icon(Icons.add_rounded, size: 15),
                               label: Text(
-                                'Add Items',
+                                'Add',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 12),
                               ),
                             ),
@@ -3217,6 +3538,8 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                               icon: const Icon(Icons.payments_rounded, size: 15),
                               label: Text(
                                 'Settle',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: GoogleFonts.urbanist(fontWeight: FontWeight.w900, fontSize: 12),
                               ),
                             ),
@@ -3251,6 +3574,19 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
 
   double _manualDiscount = 0.0;
   double _cashTendered = 0.0;
+
+  // How many room-charge units the service charge represents, when it divides
+  // evenly into the table's base ROOM_CHARGE; null otherwise. Lets the sheet
+  // spell out WHY the room charge total is what it is after extensions.
+  int? get _roomChargeUnits {
+    final rate = widget.order.roomCharge;
+    final total = widget.order.serviceCharge;
+    if (rate <= 0 || total <= 0) return null;
+    final q = total / rate;
+    final rounded = q.round();
+    if (rounded >= 1 && (q - rounded).abs() < 0.01) return rounded;
+    return null;
+  }
 
   @override
   void initState() {
@@ -3476,9 +3812,23 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                                 ),
                                 const SizedBox(width: 12),
                                 Expanded(
-                                  child: Text(
-                                    'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})',
-                                    style: GoogleFonts.urbanist(fontSize: 14.5, fontWeight: FontWeight.w800, color: const Color(0xFFD97706)),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        _roomChargeUnits != null && _roomChargeUnits! > 1
+                                            ? 'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})  ×${_roomChargeUnits!}'
+                                            : 'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})',
+                                        style: GoogleFonts.urbanist(fontSize: 14.5, fontWeight: FontWeight.w800, color: const Color(0xFFD97706)),
+                                      ),
+                                      if (_roomChargeUnits != null && widget.order.roomCharge > 0)
+                                        Text(
+                                          _roomChargeUnits! > 1
+                                              ? 'Base ₱${formatPrice(widget.order.roomCharge)} + ${_roomChargeUnits! - 1} extension${_roomChargeUnits! - 1 == 1 ? '' : 's'}  (₱${formatPrice(widget.order.roomCharge)} × ${_roomChargeUnits!})'
+                                              : 'Base rate ₱${formatPrice(widget.order.roomCharge)}',
+                                          style: GoogleFonts.urbanist(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.grey.shade500),
+                                        ),
+                                    ],
                                   ),
                                 ),
                                 Text(
@@ -3502,7 +3852,12 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
-                              Text('Room Charge', style: GoogleFonts.urbanist(fontSize: 13.5, fontWeight: FontWeight.w700, color: const Color(0xFFD97706))),
+                              Text(
+                                _roomChargeUnits != null && _roomChargeUnits! > 1 && widget.order.roomCharge > 0
+                                    ? 'Room Charge (₱${formatPrice(widget.order.roomCharge)} × ${_roomChargeUnits!})'
+                                    : 'Room Charge',
+                                style: GoogleFonts.urbanist(fontSize: 13.5, fontWeight: FontWeight.w700, color: const Color(0xFFD97706)),
+                              ),
                               Text('₱${formatPrice(roomCharge)}', style: GoogleFonts.urbanist(fontSize: 14.5, fontWeight: FontWeight.w800, color: const Color(0xFFD97706))),
                             ],
                           ),

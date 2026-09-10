@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../models.dart' show formatPrice;
 import '../waiter_models.dart';
 import '../widgets/waiter_ui.dart';
+import '../services/waiter_cart_store.dart';
 
 class TablesTab extends StatelessWidget {
   final List<WaiterTable> tables;
@@ -11,6 +13,7 @@ class TablesTab extends StatelessWidget {
   final void Function(WaiterTable table) onGetOrder;
   final void Function(WaiterTable table) onAddOrder;
   final void Function(WaiterTable table) onEditOrder;
+  final void Function(WaiterTable table) onExtendRoomCharge;
   // Lets the sidebar's Occupied/Available submenu reuse this same grid with
   // a pre-filtered `tables` list, just relabeling the header/empty-state
   // text to match — the filtering itself happens in the caller.
@@ -34,6 +37,7 @@ class TablesTab extends StatelessWidget {
     required this.onGetOrder,
     required this.onAddOrder,
     required this.onEditOrder,
+    required this.onExtendRoomCharge,
     this.title = 'Table Monitoring',
     this.emptyMessage = 'No tables found',
     this.currentFilter = 'all',
@@ -208,47 +212,71 @@ class TablesTab extends StatelessWidget {
 
     final tableOrderStatus = _buildTableOrderStatus();
 
-    // Size columns off the space this grid actually has, not the full
-    // window width — the sidebar (~280-320px) already eats into that, and
-    // picking a column count off the raw screen width squeezed cards down
-    // to ~128px, which is what was blowing up the layout below.
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final width = constraints.maxWidth;
-        final crossAxisCount = width > 1150
-            ? 5
-            : width > 850
-                ? 4
-                : width > 560
-                    ? 3
-                    : width > 320
-                        ? 2
-                        : 1;
+    // Room-charge tables that currently have an active order get an extra
+    // "Extend Room Charge" button, so those cards need more vertical room.
+    final anyExtendable = tables.any((t) =>
+        t.hasRoomCharge &&
+        orders.any((o) =>
+            o.tableId == t.id && (o.status == 2 || o.status == 3)));
 
-        return GridView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: tables.length,
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: crossAxisCount,
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 12,
-            mainAxisExtent: 255,
-          ),
-          itemBuilder: (context, index) {
-            final table = tables[index];
-            final statusInfo = statusInfoFor(table.status);
-            final orderStatusInfo = tableOrderStatus[table.id] ??
-                const StatusInfo('No Order', Colors.grey);
-            return _TableCard(
-              table: table,
-              statusInfo: statusInfo,
-              orderStatusInfo: orderStatusInfo,
-              orders: orders,
-              onViewDetails: onViewDetails,
-              onGetOrder: onGetOrder,
-              onAddOrder: onAddOrder,
-              onEditOrder: onEditOrder,
+    // Rebuild the grid whenever a Get Order cart is saved/placed/emptied, so
+    // the "unplaced cart" badge on a table card stays in sync without the
+    // waiter having to pull-to-refresh.
+    return AnimatedBuilder(
+      animation: WaiterCartStore.instance,
+      builder: (context, _) {
+        final anyPendingCart = tables.any(
+            (t) => WaiterCartStore.instance.pendingItemCountForTable(t.id) > 0);
+
+        // Size columns off the space this grid actually has, not the full
+        // window width — the sidebar (~280-320px) already eats into that, and
+        // picking a column count off the raw screen width squeezed cards down
+        // to ~128px, which is what was blowing up the layout below.
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final width = constraints.maxWidth;
+            final crossAxisCount = width > 1150
+                ? 5
+                : width > 850
+                    ? 4
+                    : width > 560
+                        ? 3
+                        : width > 320
+                            ? 2
+                            : 1;
+
+            return GridView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: tables.length,
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: crossAxisCount,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+                mainAxisExtent: (anyExtendable ? 300 : 255) +
+                    (anyPendingCart ? 58 : 0),
+              ),
+              itemBuilder: (context, index) {
+                final table = tables[index];
+                final statusInfo = statusInfoFor(table.status);
+                final orderStatusInfo = tableOrderStatus[table.id] ??
+                    const StatusInfo('No Order', Colors.grey);
+                return _TableCard(
+                  table: table,
+                  statusInfo: statusInfo,
+                  orderStatusInfo: orderStatusInfo,
+                  orders: orders,
+                  cartPendingCount: WaiterCartStore.instance
+                      .pendingItemCountForTable(table.id),
+                  cartPendingTotal:
+                      WaiterCartStore.instance.pendingTotalForTable(table.id),
+                  onViewDetails: onViewDetails,
+                  onGetOrder: onGetOrder,
+                  onAddOrder: onAddOrder,
+                  onEditOrder: onEditOrder,
+                  onExtendRoomCharge: onExtendRoomCharge,
+                );
+              },
             );
           },
         );
@@ -281,20 +309,28 @@ class _TableCard extends StatelessWidget {
   final StatusInfo statusInfo;
   final StatusInfo orderStatusInfo;
   final List<WaiterOrder> orders;
+  // Units / peso value of a Get Order cart the waiter started for this table
+  // but hasn't placed yet (0 when there is none).
+  final int cartPendingCount;
+  final double cartPendingTotal;
   final void Function(WaiterTable table) onViewDetails;
   final void Function(WaiterTable table) onGetOrder;
   final void Function(WaiterTable table) onAddOrder;
   final void Function(WaiterTable table) onEditOrder;
+  final void Function(WaiterTable table) onExtendRoomCharge;
 
   const _TableCard({
     required this.table,
     required this.statusInfo,
     required this.orderStatusInfo,
     required this.orders,
+    this.cartPendingCount = 0,
+    this.cartPendingTotal = 0,
     required this.onViewDetails,
     required this.onGetOrder,
     required this.onAddOrder,
     required this.onEditOrder,
+    required this.onExtendRoomCharge,
   });
 
   static const _navy = Color(0xFF0C0E2B);
@@ -304,7 +340,16 @@ class _TableCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isAvailable = table.status == 1;
-    final actionLabel = isAvailable ? 'Get Order' : 'View Details';
+    final hasPendingCart = cartPendingCount > 0;
+    final actionLabel = isAvailable
+        ? (hasPendingCart ? 'Resume Order' : 'Get Order')
+        : 'View Details';
+
+    // "Extend Room Charge" only makes sense for a VIP/KTV room (has a room
+    // charge configured) that currently has an active order to extend.
+    final hasActiveOrder = orders.any((o) =>
+        o.tableId == table.id && (o.status == 2 || o.status == 3));
+    final showExtend = table.hasRoomCharge && hasActiveOrder;
 
     final rawName = table.number.trim();
     final cleanTableName = rawName.toLowerCase().startsWith('table')
@@ -393,6 +438,54 @@ class _TableCard extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 10),
+              if (hasPendingCart) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: _gold.withValues(alpha: 0.16),
+                    borderRadius: BorderRadius.circular(9),
+                    border: Border.all(color: _gold.withValues(alpha: 0.55)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(Icons.shopping_cart_rounded, size: 15, color: _gold),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Unplaced Order',
+                            style: GoogleFonts.urbanist(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w900,
+                              color: _gold,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 3),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.center,
+                        child: Text(
+                          '$cartPendingCount item${cartPendingCount == 1 ? '' : 's'} · ₱${formatPrice(cartPendingTotal)}',
+                          maxLines: 1,
+                          style: GoogleFonts.urbanist(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w800,
+                            color: _gold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
               _InfoRow(
                 label: 'Order Status',
                 value: orderStatusInfo.label,
@@ -480,6 +573,26 @@ class _TableCard extends StatelessWidget {
                         ),
                       ],
                     ),
+                    if (showExtend) ...[
+                      const SizedBox(height: 6),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: () => onExtendRoomCharge(table),
+                          icon: const Icon(Icons.more_time_rounded, size: 16),
+                          label: Text(
+                            'Extend Room Charge',
+                            style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 13),
+                          ),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xFF7DD3A8),
+                            side: const BorderSide(color: Color(0xFF7DD3A8)),
+                            padding: const EdgeInsets.symmetric(vertical: 9),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
             ],

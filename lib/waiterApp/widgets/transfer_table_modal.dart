@@ -259,13 +259,18 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
                       ),
                     )
                   : GridView.builder(
-                      padding: EdgeInsets.all(isMobile ? 16 : 20),
+                      padding: EdgeInsets.fromLTRB(
+                        isMobile ? 14 : 20,
+                        14,
+                        isMobile ? 14 : 20,
+                        14,
+                      ),
                       shrinkWrap: true,
                       gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: isMobile ? 2 : 3,
-                        crossAxisSpacing: 12,
-                        mainAxisSpacing: 12,
-                        childAspectRatio: 1.4,
+                        crossAxisCount: isMobile ? 3 : 5,
+                        crossAxisSpacing: 8,
+                        mainAxisSpacing: 8,
+                        childAspectRatio: 1.15,
                       ),
                       itemCount: filtered.length,
                       itemBuilder: (context, index) {
@@ -279,19 +284,22 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
 
                         return Material(
                           color: Colors.transparent,
-                          borderRadius: BorderRadius.circular(14),
+                          borderRadius: BorderRadius.circular(12),
                           child: InkWell(
                             onTap: () {
                               setState(() {
                                 _selectedTargetTableId = table.id;
                               });
                             },
-                            borderRadius: BorderRadius.circular(14),
+                            borderRadius: BorderRadius.circular(12),
                             child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 180),
-                              padding: const EdgeInsets.all(12),
+                              duration: const Duration(milliseconds: 150),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 8,
+                              ),
                               decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(14),
+                                borderRadius: BorderRadius.circular(12),
                                 gradient: isSelected
                                     ? const LinearGradient(
                                         colors: [_navy, Color(0xFF1B1E4A)],
@@ -300,65 +308,63 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
                                 color: isSelected ? null : Colors.white,
                                 border: Border.all(
                                   color: isSelected ? _gold : Colors.grey.shade300,
-                                  width: isSelected ? 2 : 1.2,
+                                  width: isSelected ? 2 : 1,
                                 ),
                                 boxShadow: [
                                   BoxShadow(
                                     color: isSelected
-                                        ? _navy.withValues(alpha: 0.25)
-                                        : Colors.black.withValues(alpha: 0.04),
-                                    blurRadius: isSelected ? 8 : 4,
+                                        ? _navy.withValues(alpha: 0.22)
+                                        : Colors.black.withValues(alpha: 0.03),
+                                    blurRadius: isSelected ? 7 : 3,
                                     offset: const Offset(0, 2),
                                   ),
                                 ],
                               ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              child: Stack(
                                 children: [
-                                  Row(
-                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                    children: [
-                                      Text(
-                                        'TABLE',
-                                        style: GoogleFonts.urbanist(
-                                          fontSize: 10.5,
-                                          fontWeight: FontWeight.w800,
-                                          letterSpacing: 1.1,
-                                          color: isSelected ? _gold : Colors.grey.shade600,
+                                  Center(
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Text(
+                                          cleanTableName,
+                                          textAlign: TextAlign.center,
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: GoogleFonts.urbanist(
+                                            fontSize: 15,
+                                            height: 1.05,
+                                            fontWeight: FontWeight.w900,
+                                            color: isSelected ? Colors.white : _navy,
+                                          ),
                                         ),
-                                      ),
-                                      if (isSelected)
-                                        const Icon(
-                                          Icons.check_circle_rounded,
-                                          color: _gold,
-                                          size: 18,
-                                        ),
-                                    ],
-                                  ),
-                                  FittedBox(
-                                    fit: BoxFit.scaleDown,
-                                    alignment: Alignment.centerLeft,
-                                    child: Text(
-                                      cleanTableName,
-                                      maxLines: 1,
-                                      style: GoogleFonts.urbanist(
-                                        fontSize: 16.5,
-                                        fontWeight: FontWeight.w900,
-                                        color: isSelected ? Colors.white : _navy,
-                                      ),
+                                        if (table.capacity > 0) ...[
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            '${table.capacity} seats',
+                                            style: GoogleFonts.urbanist(
+                                              fontSize: 10.5,
+                                              fontWeight: FontWeight.w600,
+                                              color: isSelected
+                                                  ? Colors.white.withValues(alpha: 0.7)
+                                                  : Colors.grey.shade500,
+                                            ),
+                                          ),
+                                        ],
+                                      ],
                                     ),
                                   ),
-                                  Text(
-                                    'Capacity: ${table.capacity}',
-                                    style: GoogleFonts.urbanist(
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: isSelected
-                                          ? Colors.white.withValues(alpha: 0.75)
-                                          : Colors.grey.shade600,
+                                  if (isSelected)
+                                    const Positioned(
+                                      top: 0,
+                                      right: 0,
+                                      child: Icon(
+                                        Icons.check_circle_rounded,
+                                        color: _gold,
+                                        size: 16,
+                                      ),
                                     ),
-                                  ),
                                 ],
                               ),
                             ),

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../shared/app_config.dart';
 
 String formatPrice(num value) {
   final s = value.toStringAsFixed(2);
@@ -67,7 +68,7 @@ class MenuItem {
       categoryName: data['category_name'],
       categoryId: categoryId, // Store category_id from API (properly converted to int)
       icon: Icons.restaurant_menu,
-      imageUrl: data['image'],
+      imageUrl: AppConfig.resolveAssetUrl(data['image']),
       isAvailable: data['is_available'] ?? true,
       salesQty: rawSalesQty is int
           ? rawSalesQty
@@ -120,7 +121,7 @@ class CartItem {
         categoryName: itemData['categoryName'],
         categoryId: itemData['categoryId'],
         icon: Icons.restaurant_menu,
-        imageUrl: itemData['imageUrl'],
+        imageUrl: AppConfig.resolveAssetUrl(itemData['imageUrl']),
         isAvailable: itemData['isAvailable'] ?? true,
       ),
       quantity: json['quantity'] ?? 1,

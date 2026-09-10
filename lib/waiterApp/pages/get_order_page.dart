@@ -6,6 +6,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../models.dart';
 import '../waiter_models.dart';
 import '../services/api_service.dart';
+import '../services/waiter_cart_store.dart';
 import '../../shared/globals.dart';
 import '../../shared/settings_sheet.dart';
 import '../../menuApp/widgets/menu_background.dart';
@@ -16,6 +17,7 @@ import '../widgets/get_order_cart_panel.dart';
 import '../widgets/center_popup.dart';
 import '../widgets/item_note_modal.dart';
 import '../widgets/quick_add_drinks_carousel.dart';
+import '../widgets/fire_glow_background.dart';
 
 class GetOrderPage extends StatefulWidget {
   final WaiterTable table;
@@ -45,12 +47,19 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
   String _selectedCategory = 'All';
   String _selectedSubCategory = 'All';
   final List<CartItem> _cart = [];
+  // Key into WaiterCartStore for this table / additional-order session, so the
+  // cart survives leaving and re-entering the Get Order screen.
+  late final String _cartKey;
   String? _selectedOrderType;
   int _displayLimit = 18; // Initial limit for "All" filter
   bool _isCartPanelOpen = false;
 
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
+
+  // Horizontal scroll position of the mobile category strip, so tapping the
+  // pinned "All" chip snaps the strip back to the start (Sizzling & Pulutan).
+  final ScrollController _categoryStripController = ScrollController();
 
   List<MenuItem> _topRevenueItems = [];
   bool _isLoadingTopRevenue = false;
@@ -67,11 +76,30 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
   @override
   void initState() {
     super.initState();
+    _cartKey = WaiterCartStore.keyFor(
+      tableId: widget.table.id,
+      existingOrderId: widget.existingOrder?.id,
+    );
+    // Restore any cart the waiter built earlier for this table but hasn't
+    // placed yet (e.g. they tapped Home to check another table and came back,
+    // or the app was closed and reopened).
+    _cart.addAll(WaiterCartStore.instance.load(_cartKey));
+    // Cold start straight into a table (before Home's restore() finished) —
+    // pull the on-disk carts in and fill this one if it was still empty.
+    if (_cart.isEmpty) {
+      WaiterCartStore.instance.restore().then((_) {
+        if (!mounted || _cart.isNotEmpty) return;
+        final restored = WaiterCartStore.instance.load(_cartKey);
+        if (restored.isNotEmpty) {
+          setState(() => _cart.addAll(restored));
+        }
+      });
+    }
     final cachedRaw = ApiService.cachedTopRevenueRaw;
     if (cachedRaw != null && cachedRaw.isNotEmpty) {
       _topRevenueItems = _resolveTopRevenueItems(cachedRaw);
     }
-    _categories = _buildCategories(widget.menuItems);
+    _categories = _buildCategories();
     _selectedOrderType = 'DINE_IN';
 
     _flyController = AnimationController(
@@ -118,14 +146,14 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
       if (_topRevenueItems.isEmpty) {
         setState(() => _isLoadingTopRevenue = true);
       }
-      final res = await ApiService.getTopRevenueItems(limit: 15);
+      final res = await ApiService.getTopRevenueItems(limit: 120);
       if (res['success'] == true && res['data'] is List) {
         final rawList = res['data'] as List;
         final items = _resolveTopRevenueItems(rawList);
         if (mounted && items.isNotEmpty) {
           setState(() {
             _topRevenueItems = items;
-            _categories = _buildCategories(widget.menuItems);
+            _categories = _buildCategories();
           });
         }
       }
@@ -153,9 +181,19 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
 
   @override
   void dispose() {
+    // Safety net — the mutation helpers already persist on every change, but
+    // this covers anything that slipped through before the page went away.
+    _persistCart();
     _flyController.dispose();
     _searchController.dispose();
+    _categoryStripController.dispose();
     super.dispose();
+  }
+
+  /// Mirrors the current cart into WaiterCartStore so it survives navigation
+  /// away from this screen (and shows up on the Tables dashboard card).
+  void _persistCart() {
+    WaiterCartStore.instance.save(_cartKey, _cart);
   }
 
   static const Map<int, int> _dbSalesQty = {
@@ -356,13 +394,38 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
     return drinks.take(15).toList();
   }
 
+  /// Ranked top-revenue list. The API/cache order is authoritative for the
+  /// items it returned; anything short of [max] is padded from the full menu
+  /// sorted by sales, so the section and its "View All" view always fill up
+  /// even when the endpoint returns a short list or is offline.
+  List<MenuItem> _rankedTopRevenue({required int max}) {
+    final seen = <String>{};
+    final result = <MenuItem>[];
+    void add(MenuItem m) {
+      if (result.length >= max) return;
+      final key = m.id?.toString() ?? m.name.toLowerCase();
+      if (seen.add(key)) result.add(m);
+    }
+
+    for (final m in _topRevenueItems) {
+      add(m);
+    }
+    if (result.length < max) {
+      final rest = List<MenuItem>.from(widget.menuItems)..sort(_compareBySales);
+      for (final m in rest) {
+        add(m);
+      }
+    }
+    return result;
+  }
+
   List<MenuItem> _getItemsForCategory(String category) {
     if (category == 'All') {
       final all = List<MenuItem>.from(widget.menuItems);
       all.sort(_compareBySales);
       return all;
     }
-    if (category == topRevenueCategory) return _topRevenueItems;
+    if (category == topRevenueCategory) return _rankedTopRevenue(max: 100);
     if (category == sizzlingCategory) return _getSizzlingPulutanItems();
     if (category == chickenCategory) return _getChickenItems();
     if (category == beerDrinkCategory) return _getBeerDrinkItems();
@@ -376,18 +439,18 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
     return list;
   }
 
-  List<String> _buildCategories(List<MenuItem> items) {
-    final set = <String>{};
-    for (final item in items) {
-      final category = item.categoryName ?? item.category;
-      if (category.trim().isEmpty) continue;
-      set.add(category);
-    }
-    final list = set.toList()..sort();
+  List<String> _buildCategories() {
+    // The Get Order filter bar mirrors the curated groups shown in the
+    // "All Menu Items" section (Sizzling & Pulutan, Chicken & Wings, …)
+    // instead of every raw DB category, so the two rows stay consistent.
+    // Only groups that actually have matching items are shown.
     return [
       'All',
-      if (_topRevenueItems.isNotEmpty) topRevenueCategory,
-      ...list,
+      if (_getSizzlingPulutanItems().isNotEmpty) sizzlingCategory,
+      if (_getChickenItems().isNotEmpty) chickenCategory,
+      if (_getBeerDrinkItems().isNotEmpty) beerDrinkCategory,
+      if (_getPizzaRiceItems().isNotEmpty) pizzaRiceCategory,
+      if (_getDessertItems().isNotEmpty) dessertsCategory,
     ];
   }
 
@@ -465,6 +528,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         _cart.add(CartItem(item: item, quantity: 1));
       }
     });
+    _persistCart();
   }
 
   void _decreaseItemQuantity(MenuItem item) {
@@ -478,12 +542,14 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         }
       }
     });
+    _persistCart();
   }
 
   void _removeItemAt(int index) {
     setState(() {
       _cart.removeAt(index);
     });
+    _persistCart();
   }
 
   Future<void> _showFlyAnimation(BuildContext context, MenuItem item) {
@@ -739,97 +805,159 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
     );
   }
 
-  Widget _buildTopRevenueQuantityControl({
-    required MenuItem item,
-  }) {
-    final quantity = _getItemQuantity(item);
-    if (quantity == 0) {
-      return Builder(
-        builder: (btnCtx) => Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(12),
-            gradient: const LinearGradient(
-              colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: const Color(0xFF0C0E2B).withValues(alpha: 0.3),
-                blurRadius: 6,
-                offset: const Offset(0, 2),
-              ),
+  // Top Revenue section preview — "pill" cards (no image): big item name +
+  // price on the left, add / qty control on the right. Up to 16 items laid
+  // out as two rows of eight that scroll sideways together.
+  Widget _buildTopRevenueScroller(List<MenuItem> items) {
+    const pillWidth = 220.0;
+    const perRow = 8;
+    final firstRow = items.take(perRow).toList();
+    final secondRow = items.skip(perRow).take(perRow).toList();
+
+    Widget row(List<MenuItem> r) => IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (int i = 0; i < r.length; i++) ...[
+                if (i > 0) const SizedBox(width: 10),
+                SizedBox(width: pillWidth, child: _buildTopRevenuePill(r[i])),
+              ],
             ],
           ),
-          child: IconButton(
-            icon: const Icon(Icons.add, size: 22, color: Colors.white),
-            onPressed: () => _onAddPressed(btnCtx, item),
-            padding: const EdgeInsets.all(6),
-            constraints: const BoxConstraints(
-              minWidth: 36,
-              minHeight: 36,
-            ),
-            style: IconButton.styleFrom(
-              backgroundColor: Colors.transparent,
-              foregroundColor: Colors.white,
-              alignment: Alignment.center,
-            ),
-          ),
-        ),
-      );
-    }
+        );
+
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      physics: const BouncingScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(16, 2, 16, 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          row(firstRow),
+          if (secondRow.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            row(secondRow),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTopRevenuePill(MenuItem item) {
+    final quantity = _getItemQuantity(item);
+    final active = quantity > 0;
     return Builder(
       builder: (btnCtx) => Container(
-        key: ValueKey('top_${item.name}_$quantity'),
+        padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          gradient: const LinearGradient(
-            colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: active
+                ? const Color(0xFF0C0E2B)
+                : const Color(0xFFE8C468).withValues(alpha: 0.55),
+            width: active ? 1.8 : 1.2,
           ),
           boxShadow: [
             BoxShadow(
-              color: const Color(0xFF0C0E2B).withValues(alpha: 0.3),
-              blurRadius: 6,
-              offset: const Offset(0, 2),
+              color: Colors.black.withValues(alpha: 0.06),
+              blurRadius: 8,
+              offset: const Offset(0, 3),
             ),
           ],
         ),
         child: Row(
-          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            IconButton(
-              icon: const Icon(Icons.remove, size: 19, color: Colors.white),
-              onPressed: () => _decreaseItemQuantity(item),
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 36),
-              style: IconButton.styleFrom(
-                backgroundColor: Colors.transparent,
-                foregroundColor: Colors.white,
-                alignment: Alignment.center,
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    item.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.urbanist(
+                      fontSize: 15,
+                      height: 1.15,
+                      fontWeight: FontWeight.w800,
+                      color: const Color(0xFF0C0E2B),
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '₱${formatPrice(item.price)}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.urbanist(
+                      fontSize: 13.5,
+                      height: 1.1,
+                      fontWeight: FontWeight.w900,
+                      color: const Color(0xFFB88A1E),
+                    ),
+                  ),
+                ],
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 3),
-              child: Text(
-                '$quantity',
-                style: GoogleFonts.urbanist(
-                  fontWeight: FontWeight.w800,
-                  fontSize: 14.5,
-                  color: Colors.white,
+            const SizedBox(width: 10),
+            if (active)
+              Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _pillIconButton(Icons.remove, () => _decreaseItemQuantity(item), size: 20, padding: 7),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 3),
+                      child: Text(
+                        '$quantity',
+                        style: GoogleFonts.urbanist(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w900,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    _pillIconButton(Icons.add, () => _onAddPressed(btnCtx, item), size: 20, padding: 7),
+                  ],
+                ),
+              )
+            else
+              Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
+                  ),
+                ),
+                child: _pillIconButton(
+                  Icons.add,
+                  () => _onAddPressed(btnCtx, item),
+                  size: 24,
+                  padding: 9,
                 ),
               ),
-            ),
-            IconButton(
-              icon: const Icon(Icons.add, size: 19, color: Colors.white),
-              onPressed: () => _onAddPressed(btnCtx, item),
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 36),
-              style: IconButton.styleFrom(
-                backgroundColor: Colors.transparent,
-                foregroundColor: Colors.white,
-                alignment: Alignment.center,
-              ),
-            ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _pillIconButton(IconData icon, VoidCallback onTap, {double size = 20, double padding = 6}) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: EdgeInsets.all(padding),
+        child: Icon(icon, size: size, color: Colors.white),
       ),
     );
   }
@@ -1158,6 +1286,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                                                 onSaved: () {
                                                   setState(() {});
                                                   setModalState(() {});
+                                                  _persistCart();
                                                 },
                                               ),
                                               borderRadius: BorderRadius.circular(6),
@@ -1197,6 +1326,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                                                 onSaved: () {
                                                   setState(() {});
                                                   setModalState(() {});
+                                                  _persistCart();
                                                 },
                                               ),
                                               borderRadius: BorderRadius.circular(4),
@@ -1614,6 +1744,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         setState(() {
           _cart.clear();
         });
+        WaiterCartStore.instance.clear(_cartKey);
         showCenterPopup(
           context,
           icon: Icons.check_circle,
@@ -1708,6 +1839,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         setState(() {
           _cart.clear();
         });
+        WaiterCartStore.instance.clear(_cartKey);
         showCenterPopup(
           context,
           icon: Icons.check_circle,
@@ -1817,17 +1949,21 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
           ? AppBar(
               title: Text(
                 tableLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
                 style: GoogleFonts.urbanist(
-                  fontSize: 22.5,
+                  fontSize: 19,
                   fontWeight: FontWeight.w800,
                   color: const Color(0xFF0C0E2B),
                   letterSpacing: 0.2,
                 ),
               ),
               centerTitle: true,
+              leadingWidth: 60,
               leading: IconButton(
-                icon: const Icon(Icons.arrow_back, color: Colors.black),
-                iconSize: 32,
+                icon: const HomeGlyph(size: 32, color: Color(0xFF0C0E2B)),
+                tooltip: 'Home',
                 onPressed: () => Navigator.pop(context),
               ),
               actions: [
@@ -1917,21 +2053,57 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                     Container(
                       height: 58,
                       padding: const EdgeInsets.symmetric(vertical: 4),
-                      child: ListView.builder(
-                        scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(horizontal: 14),
-                        itemCount: _categories.length,
-                        itemBuilder: (context, index) {
-                          final category = _categories[index];
-                          final isSelected = category == _selectedCategory;
-                          final count = categoryCounts[category] ?? 0;
-                          return _buildCategoryChip(
-                            category: category,
-                            count: count,
-                            isSelected: isSelected,
-                            onTap: () => _selectCategory(category),
-                          );
-                        },
+                      child: Row(
+                        children: [
+                          // "All" stays pinned on the left so the waiter can
+                          // jump back to the full menu (incl. Top Revenue)
+                          // without scrolling the category strip back.
+                          Padding(
+                            padding: const EdgeInsets.only(left: 14),
+                            child: _buildCategoryChip(
+                              category: 'All',
+                              count: categoryCounts['All'] ?? widget.menuItems.length,
+                              isSelected: _selectedCategory == 'All',
+                              onTap: () {
+                                _selectCategory('All');
+                                // Snap the strip back to the start so the
+                                // first category (Sizzling & Pulutan) is in view.
+                                if (_categoryStripController.hasClients) {
+                                  _categoryStripController.animateTo(
+                                    0,
+                                    duration: const Duration(milliseconds: 320),
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                }
+                              },
+                            ),
+                          ),
+                          Container(
+                            width: 1.4,
+                            height: 26,
+                            margin: const EdgeInsets.symmetric(horizontal: 8),
+                            color: Colors.grey.shade300,
+                          ),
+                          Expanded(
+                            child: ListView.builder(
+                              controller: _categoryStripController,
+                              scrollDirection: Axis.horizontal,
+                              padding: const EdgeInsets.only(right: 14),
+                              itemCount: _categories.length - 1,
+                              itemBuilder: (context, index) {
+                                final category = _categories[index + 1];
+                                final isSelected = category == _selectedCategory;
+                                final count = categoryCounts[category] ?? 0;
+                                return _buildCategoryChip(
+                                  category: category,
+                                  count: count,
+                                  isSelected: isSelected,
+                                  onTap: () => _selectCategory(category),
+                                );
+                              },
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   Expanded(child: _buildMenuPane(context)),
@@ -1956,8 +2128,8 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                           child: Row(
                             children: [
                               IconButton(
-                                icon: const Icon(Icons.arrow_back, color: Colors.black),
-                                iconSize: 32,
+                                icon: const HomeGlyph(size: 34, color: Color(0xFF0C0E2B)),
+                                tooltip: 'Home',
                                 onPressed: () => Navigator.pop(context),
                                 padding: EdgeInsets.zero,
                                 constraints: const BoxConstraints(),
@@ -2093,50 +2265,102 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                 ],
               ),
       ),
-      floatingActionButton: Container(
+      // One prominent gold cart button, floating bottom-centre where the
+      // waiter's thumb naturally rests — same fixed spot every time, high
+      // contrast against the pale page and navy cards, and a big tap target.
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+      floatingActionButton: (_cart.isNotEmpty && !showCartPanel)
+          ? _buildCartButton(canShowSideCart: canShowSideCart)
+          : null,
+    );
+  }
+
+  Widget _buildCartButton({required bool canShowSideCart}) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: FireGlowBackground(
+        child: Material(
         key: _cartFabKey,
-        decoration: (_cart.isNotEmpty && !showCartPanel)
-            ? BoxDecoration(
-                borderRadius: BorderRadius.circular(16),
-                gradient: const LinearGradient(
-                  colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
+        color: const Color(0xFFE8C468),
+        borderRadius: BorderRadius.circular(32),
+        elevation: 8,
+        shadowColor: const Color(0xFF0C0E2B).withValues(alpha: 0.55),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(32),
+          onTap: canShowSideCart
+              ? () => setState(() => _isCartPanelOpen = !_isCartPanelOpen)
+              : _showCartSheet,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 20, 12),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Cart icon + count, wrapped in a dark disc so it reads
+                // clearly on the gold.
+                Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 40,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF0C0E2B),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.shopping_cart_outlined,
+                          color: Color(0xFFE8C468), size: 22),
+                    ),
+                    Positioned(
+                      right: -4,
+                      top: -4,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: const Color(0xFFE8C468), width: 2),
+                        ),
+                        child: Text(
+                          '$_totalItems',
+                          textAlign: TextAlign.center,
+                          style: GoogleFonts.urbanist(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w900,
+                            color: const Color(0xFF0C0E2B),
+                            height: 1,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-                boxShadow: [
-                  BoxShadow(
-                    color: const Color(0xFF0C0E2B).withOpacity(0.4),
-                    blurRadius: 15,
-                    offset: const Offset(0, 8),
+                const SizedBox(width: 14),
+                Text(
+                  'View Order',
+                  style: GoogleFonts.urbanist(
+                    fontSize: 15.5,
+                    fontWeight: FontWeight.w900,
+                    color: const Color(0xFF0C0E2B),
                   ),
-                ],
-              )
-            : null,
-        child: (_cart.isNotEmpty && !showCartPanel)
-            ? FloatingActionButton.extended(
-                onPressed: canShowSideCart
-                    ? () => setState(() => _isCartPanelOpen = !_isCartPanelOpen)
-                    : _showCartSheet,
-                backgroundColor: Colors.transparent,
-                elevation: 0,
-                icon: Badge(
-                  label: Text('$_totalItems'),
-                  child: const Icon(Icons.shopping_cart_outlined, color: Colors.white),
                 ),
-                label: Text(
+                const SizedBox(width: 10),
+                Container(width: 1.4, height: 20, color: const Color(0xFF0C0E2B).withValues(alpha: 0.25)),
+                const SizedBox(width: 10),
+                Text(
                   '₱${formatPrice(_totalPrice)}',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
+                  style: GoogleFonts.urbanist(
+                    fontSize: 17,
+                    fontWeight: FontWeight.w900,
+                    color: const Color(0xFF0C0E2B),
                   ),
                 ),
-              )
-            : const IgnorePointer(
-                child: Opacity(
-                  opacity: 0,
-                  child: SizedBox(width: 56, height: 56),
-                ),
-              ),
+              ],
+            ),
+          ),
+        ),
+        ),
       ),
-      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
     );
   }
 
@@ -2170,6 +2394,12 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
     if (name.contains('pasta') || name.contains('noodle')) return Icons.ramen_dining_rounded;
     return Icons.restaurant_rounded;
   }
+
+  // Strips the leading emoji from a category constant so the filter chip
+  // shows a clean label ("Sizzling & Pulutan") matching the "All Menu Items"
+  // sub-category chips, while the raw value still drives the filtering.
+  String _categoryLabel(String category) =>
+      category.replaceFirst(RegExp(r'^[^\w(]+\s*'), '').trim();
 
   Widget _buildCategoryChip({
     required String category,
@@ -2234,7 +2464,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  category,
+                  _categoryLabel(category),
                   style: GoogleFonts.urbanist(
                     fontSize: 15,
                     fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
@@ -2302,94 +2532,6 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         },
         separatorBuilder: (_, __) => const Divider(height: 1),
         itemCount: _categories.length,
-      ),
-    );
-  }
-
-  Widget _buildSubCategoryChip({
-    required String category,
-    required String label,
-    required IconData icon,
-    required int count,
-  }) {
-    final isSelected = _selectedSubCategory == category;
-    return Container(
-      margin: const EdgeInsets.only(right: 10, top: 3, bottom: 3),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(28),
-        child: InkWell(
-          onTap: () {
-            setState(() {
-              _selectedSubCategory = category;
-            });
-          },
-          borderRadius: BorderRadius.circular(28),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 200),
-            curve: Curves.easeOut,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(28),
-              gradient: isSelected
-                  ? const LinearGradient(
-                      colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
-                    )
-                  : null,
-              color: isSelected ? null : Colors.white,
-              border: Border.all(
-                color: isSelected ? const Color(0xFF0C0E2B) : Colors.grey.shade300,
-                width: 1.2,
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: isSelected
-                      ? const Color(0xFF0C0E2B).withValues(alpha: 0.25)
-                      : Colors.black.withValues(alpha: 0.05),
-                  blurRadius: isSelected ? 10 : 4,
-                  offset: isSelected ? const Offset(0, 4) : const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  icon,
-                  size: 20,
-                  color: isSelected ? const Color(0xFFE8C468) : const Color(0xFF0C0E2B),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: GoogleFonts.urbanist(
-                    fontSize: 15,
-                    fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
-                    color: isSelected ? Colors.white : const Color(0xFF0C0E2B),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2.5),
-                  decoration: BoxDecoration(
-                    color: isSelected
-                        ? Colors.white.withValues(alpha: 0.2)
-                        : Colors.grey.shade100,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(
-                    '$count',
-                    style: GoogleFonts.urbanist(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.bold,
-                      color: isSelected ? Colors.white : Colors.grey.shade700,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
     );
   }
@@ -2535,7 +2677,10 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                 ),
               ),
             ] else if (_selectedCategory == 'All') ...[
-              if (_topRevenueItems.isNotEmpty) ...[
+              // Show whenever we can rank anything — the /api/menu/top-revenue
+              // endpoint may be missing on the backend, in which case
+              // _rankedTopRevenue falls back to the menu sorted by sales.
+              if (_rankedTopRevenue(max: 1).isNotEmpty) ...[
                 SliverToBoxAdapter(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
@@ -2567,7 +2712,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                       TextButton(
                         onPressed: () => _selectCategory(topRevenueCategory),
                         child: Text(
-                          'View All (${_topRevenueItems.length})',
+                          'View All (${_rankedTopRevenue(max: 100).length})',
                           style: GoogleFonts.urbanist(
                             fontSize: availableWidth < 500 ? 14 : 15,
                             fontWeight: FontWeight.w800,
@@ -2580,196 +2725,37 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                 ),
               ),
               SliverToBoxAdapter(
-                child: SizedBox(
-                  height: 238,
-                  child: ListView.builder(
-                    scrollDirection: Axis.horizontal,
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    itemCount: _topRevenueItems.length,
-                    itemBuilder: (context, index) {
-                      final item = _topRevenueItems[index];
-                      return Container(
-                        width: 180,
-                        margin: const EdgeInsets.only(right: 12, bottom: 4),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: const Color(0xFFE8C468).withValues(alpha: 0.5), width: 1),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withValues(alpha: 0.06),
-                              blurRadius: 8,
-                              offset: const Offset(0, 3),
-                            ),
-                          ],
-                        ),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(14),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Expanded(
-                                child: Stack(
-                                  children: [
-                                    Positioned.fill(
-                                      child: item.imageUrl != null && item.imageUrl!.isNotEmpty
-                                          ? Image.network(
-                                              item.imageUrl!,
-                                              fit: BoxFit.cover,
-                                              gaplessPlayback: true,
-                                              errorBuilder: (_, __, ___) => Container(
-                                                color: Colors.grey.shade200,
-                                                child: const Icon(Icons.restaurant, color: Colors.grey),
-                                              ),
-                                            )
-                                          : Container(
-                                              color: Colors.grey.shade200,
-                                              child: const Icon(Icons.restaurant, color: Colors.grey),
-                                            ),
-                                    ),
-                                    Positioned(
-                                      top: 6,
-                                      left: 6,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF0C0E2B).withValues(alpha: 0.85),
-                                          borderRadius: BorderRadius.circular(6),
-                                        ),
-                                        child: Text(
-                                          '#${index + 1}',
-                                          style: GoogleFonts.urbanist(
-                                            color: const Color(0xFFE8C468),
-                                            fontSize: 10,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              Padding(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      item.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: GoogleFonts.urbanist(
-                                        fontSize: 15.0,
-                                        fontWeight: FontWeight.w800,
-                                        color: const Color(0xFF0C0E2B),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 5),
-                                    Row(
-                                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                      crossAxisAlignment: CrossAxisAlignment.center,
-                                      children: [
-                                        Expanded(
-                                          child: FittedBox(
-                                            fit: BoxFit.scaleDown,
-                                            alignment: Alignment.centerLeft,
-                                            child: Text(
-                                              '₱${formatPrice(item.price)}',
-                                              style: GoogleFonts.urbanist(
-                                                fontSize: 16.5,
-                                                fontWeight: FontWeight.w900,
-                                                color: const Color(0xFFD97706),
-                                                letterSpacing: -0.2,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 6),
-                                        _buildTopRevenueQuantityControl(item: item),
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ),
+                child: _buildTopRevenueScroller(_rankedTopRevenue(max: 16)),
               ),
             ],
 
+              // Section title only — the category chips live in the sticky
+              // filter bar at the top of the page, so a second row here was
+              // redundant.
               SliverToBoxAdapter(
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
-                  child: SizedBox(
-                    height: 58,
-                    child: ListView(
-                      scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(vertical: 4),
-                      physics: const BouncingScrollPhysics(),
-                      children: [
-                        Center(
-                          child: Text(
-                            'All Menu Items',
-                            style: GoogleFonts.urbanist(
-                              fontSize: availableWidth < 500 ? 21.0 : 23.0,
-                              fontWeight: FontWeight.w900,
-                              color: const Color(0xFF0C0E2B),
-                              letterSpacing: -0.3,
-                            ),
-                          ),
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+                  child: Row(
+                    children: [
+                      Text(
+                        'All Menu Items',
+                        style: GoogleFonts.urbanist(
+                          fontSize: availableWidth < 500 ? 21.0 : 23.0,
+                          fontWeight: FontWeight.w900,
+                          color: const Color(0xFF0C0E2B),
+                          letterSpacing: -0.3,
                         ),
-                        const SizedBox(width: 14),
-                        Center(
-                          child: Container(
-                            height: 28,
-                            width: 1.5,
-                            color: Colors.grey.shade300,
-                            margin: const EdgeInsets.symmetric(horizontal: 4),
-                          ),
+                      ),
+                      const SizedBox(width: 10),
+                      Text(
+                        '${widget.menuItems.length}',
+                        style: GoogleFonts.urbanist(
+                          fontSize: availableWidth < 500 ? 14 : 15,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.grey.shade500,
                         ),
-                        const SizedBox(width: 10),
-                        _buildSubCategoryChip(
-                          category: 'All',
-                          label: 'All',
-                          icon: Icons.apps_rounded,
-                          count: widget.menuItems.length,
-                        ),
-                        _buildSubCategoryChip(
-                          category: sizzlingCategory,
-                          label: 'Sizzling & Pulutan',
-                          icon: Icons.outdoor_grill_rounded,
-                          count: _getSizzlingPulutanItems().length,
-                        ),
-                        _buildSubCategoryChip(
-                          category: chickenCategory,
-                          label: 'Chicken & Wings',
-                          icon: Icons.kebab_dining_rounded,
-                          count: _getChickenItems().length,
-                        ),
-                        _buildSubCategoryChip(
-                          category: beerDrinkCategory,
-                          label: 'Beers & Drinks',
-                          icon: Icons.sports_bar_rounded,
-                          count: _getBeerDrinkItems().length,
-                        ),
-                        _buildSubCategoryChip(
-                          category: pizzaRiceCategory,
-                          label: 'Pizza & Rice Meals',
-                          icon: Icons.local_pizza_rounded,
-                          count: _getPizzaRiceItems().length,
-                        ),
-                        _buildSubCategoryChip(
-                          category: dessertsCategory,
-                          label: 'Shakes & Desserts',
-                          icon: Icons.icecream_rounded,
-                          count: _getDessertItems().length,
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -2824,31 +2810,51 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
           ],
             SliverPadding(
               padding: const EdgeInsets.all(16),
-              sliver: SliverGrid(
-                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: crossAxisCount,
-                  crossAxisSpacing: spacing,
-                  mainAxisSpacing: spacing,
-                  childAspectRatio: childAspectRatio,
-                ),
-                delegate: SliverChildBuilderDelegate(
-                  (context, index) {
-                    final item = items[index];
-                    return GetOrderMenuCard(
-                      key: ValueKey('card_${item.id ?? item.name}_${item.imageUrl}'),
-                      item: item,
-                      onTap: () {},
-                      quantityControl: _buildGridQuantityControl(
-                        item: item,
-                        isMobile: availableWidth < 500,
+              sliver: _selectedCategory == topRevenueCategory
+                  ? SliverGrid(
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: availableWidth >= 900
+                            ? 4
+                            : availableWidth >= 600
+                                ? 3
+                                : 2,
+                        crossAxisSpacing: 10,
+                        mainAxisSpacing: 10,
+                        mainAxisExtent: 90,
                       ),
-                    );
-                  },
-                  childCount: items.length,
-                  addAutomaticKeepAlives: false,
-                  addRepaintBoundaries: true,
-                ),
-              ),
+                      delegate: SliverChildBuilderDelegate(
+                        (context, index) => _buildTopRevenuePill(items[index]),
+                        childCount: items.length,
+                        addAutomaticKeepAlives: false,
+                        addRepaintBoundaries: true,
+                      ),
+                    )
+                  : SliverGrid(
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: crossAxisCount,
+                        crossAxisSpacing: spacing,
+                        mainAxisSpacing: spacing,
+                        childAspectRatio: childAspectRatio,
+                      ),
+                      delegate: SliverChildBuilderDelegate(
+                        (context, index) {
+                          final item = items[index];
+                          return GetOrderMenuCard(
+                            key: ValueKey(
+                                'card_${item.id ?? item.name}_${item.imageUrl}'),
+                            item: item,
+                            onTap: () {},
+                            quantityControl: _buildGridQuantityControl(
+                              item: item,
+                              isMobile: availableWidth < 500,
+                            ),
+                          );
+                        },
+                        childCount: items.length,
+                        addAutomaticKeepAlives: false,
+                        addRepaintBoundaries: true,
+                      ),
+                    ),
             ),
             // Load More Button - only for "All" category
             if (_hasMoreItems)
@@ -2906,11 +2912,73 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                   ),
                 ),
               ),
+            // Clears the floating cart button so the last row stays tappable.
+            SliverToBoxAdapter(
+              child: SizedBox(height: _cart.isNotEmpty ? 96 : 12),
+            ),
           ],
         );
       },
     );
   }
+}
+
+/// A hand-drawn house/home glyph. Painted with a [CustomPainter] instead of an
+/// icon-font glyph so it renders no matter what happens with MaterialIcons
+/// tree-shaking or font loading on web.
+class HomeGlyph extends StatelessWidget {
+  final double size;
+  final Color color;
+  const HomeGlyph({super.key, this.size = 26, this.color = const Color(0xFF0C0E2B)});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: CustomPaint(painter: _HomeGlyphPainter(color)),
+    );
+  }
+}
+
+class _HomeGlyphPainter extends CustomPainter {
+  final Color color;
+  _HomeGlyphPainter(this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final h = size.height;
+
+    final stroke = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = w * 0.085
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round;
+
+    // House outline: left eave → roof apex → right eave → down the right
+    // wall → along the base → back up the left wall.
+    final house = Path()
+      ..moveTo(w * 0.13, h * 0.45)
+      ..lineTo(w * 0.50, h * 0.11)
+      ..lineTo(w * 0.87, h * 0.45)
+      ..lineTo(w * 0.87, h * 0.87)
+      ..lineTo(w * 0.13, h * 0.87)
+      ..close();
+    canvas.drawPath(house, stroke);
+
+    // Door.
+    final door = Path()
+      ..moveTo(w * 0.40, h * 0.87)
+      ..lineTo(w * 0.40, h * 0.58)
+      ..lineTo(w * 0.60, h * 0.58)
+      ..lineTo(w * 0.60, h * 0.87);
+    canvas.drawPath(door, stroke);
+  }
+
+  @override
+  bool shouldRepaint(_HomeGlyphPainter oldDelegate) => oldDelegate.color != color;
 }
 
 

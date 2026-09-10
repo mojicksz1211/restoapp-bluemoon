@@ -7,8 +7,9 @@ The API URL is now configurable and can be changed without modifying code.
 ### How It Works
 
 1. **Default Behavior:**
-   - **Debug Mode** (development): Uses `http://localhost:2000` (local restoAdmin backend)
-   - **Release Mode** (production): Uses `https://resto-admin.3core21.com`
+   - **Debug Mode** (development): Uses `http://192.168.110.44:2000` on a device/emulator,
+     or the browser host (`http://<host>:2000`) on Web — i.e. the local restoAdmin backend
+   - **Release Mode** (production): Uses `https://moonctgroup.com` (cloud server + cloud DB)
 
 2. **Custom URL:**
    - You can set a custom URL that will override the default
@@ -40,8 +41,8 @@ await AppConfig.clearCustomUrl();
 To change the default URLs, edit `resto/lib/shared/app_config.dart`:
 
 ```dart
-static const String _defaultDevUrl = 'http://localhost:2000';  // Change this
-static const String _defaultProdUrl = 'https://resto-admin.3core21.com';  // Change this
+static const String _defaultDevUrl = 'http://192.168.110.44:2000';  // Change this
+static const String _defaultProdUrl = 'https://moonctgroup.com';    // Change this
 ```
 
 ### Notes

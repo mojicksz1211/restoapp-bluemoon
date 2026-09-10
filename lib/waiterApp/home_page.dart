@@ -8,6 +8,7 @@ import 'models.dart';
 import 'waiter_models.dart';
 import 'services/api_service.dart';
 import 'services/socket_service.dart';
+import 'services/waiter_cart_store.dart';
 import '../shared/globals.dart';
 import '../shared/settings_sheet.dart';
 import 'widgets/confirm_order_bottom_sheet.dart';
@@ -16,6 +17,7 @@ import 'widgets/waiter_ui.dart';
 import 'widgets/waiter_sidebar.dart';
 import 'widgets/center_popup.dart';
 import 'widgets/transfer_table_modal.dart';
+import 'widgets/extend_room_charge_dialog.dart';
 import 'services/notification_service.dart';
 import 'pages/get_order_page.dart';
 import 'pages/tables_tab.dart';
@@ -38,6 +40,14 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   int? _branchId;
   String? _currentUserId;
   final Set<int> _joinedOrderIds = {};
+  // REST fallback poll — socket_io_client has no real HTTP-polling fallback
+  // on native, so on WebSocket-blocked networks the socket never connects and
+  // the dashboard would go stale. Poll every 2s (matching cashierApp) unless
+  // the socket is actually connected. [_isLoadingData] stops socket-triggered
+  // refreshes, manual refreshes and poll ticks from stacking up.
+  Timer? _pollTimer;
+  bool _isLoadingData = false;
+  bool _isManualRefreshing = false;
   VoidCallback? _disposeOrderUpdated;
   VoidCallback? _disposeOrderItemsAdded;
   VoidCallback? _disposeOrderCreated;
@@ -54,9 +64,13 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   @override
   void initState() {
     super.initState();
+    WaiterCartStore.instance.restore();
     _loadBranchId();
     _loadData();
     _initializeSocket();
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted && !SocketService.isConnected) _pollData();
+    });
   }
 
   Future<void> _loadBranchId() async {
@@ -73,11 +87,73 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
   @override
   void dispose() {
+    _pollTimer?.cancel();
     _cleanupSocket();
     super.dispose();
   }
 
+  /// Lightweight fallback poll (2s) for when the socket isn't connected:
+  /// tables + orders only, no menu refetch, no spinner.
+  Future<void> _pollData() async {
+    if (_isLoadingData) return;
+    _isLoadingData = true;
+    try {
+      final tablesResult = await ApiService.getTables();
+      if (tablesResult['unauthorized'] == true) {
+        await _redirectToLogin();
+        return;
+      }
+      final ordersResult = await ApiService.getWaiterOrders();
+      if (ordersResult['unauthorized'] == true) {
+        await _redirectToLogin();
+        return;
+      }
+      if (!mounted) return;
+      if (tablesResult['success'] == true && ordersResult['success'] == true) {
+        setState(() {
+          _tables = List<Map<String, dynamic>>.from(tablesResult['data'])
+              .map(WaiterTable.fromApi)
+              .toList();
+          _orders = List<Map<String, dynamic>>.from(ordersResult['data'])
+              .map(WaiterOrder.fromApi)
+              .toList();
+        });
+        _syncSocketOrderRooms();
+      }
+    } catch (e) {
+      debugPrint('❌ Error in _pollData: $e');
+    } finally {
+      _isLoadingData = false;
+    }
+  }
+
+  /// Manual refresh — wired to the refresh button next to Logout. Does a full
+  /// reload (tables + orders + menu) and surfaces a brief snackbar.
+  Future<void> _manualRefresh() async {
+    if (_isManualRefreshing) return;
+    setState(() => _isManualRefreshing = true);
+    try {
+      await _loadData(showSpinner: false);
+    } finally {
+      if (mounted) setState(() => _isManualRefreshing = false);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: 1),
+          content: Text('Refreshed'),
+        ),
+      );
+  }
+
   Future<void> _loadData({bool showSpinner = true}) async {
+    // Never let socket-triggered background refreshes / poll ticks stack up.
+    if (_isLoadingData) return;
+    _isLoadingData = true;
+
     if (showSpinner) {
       setState(() {
         _isLoading = true;
@@ -137,6 +213,8 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
         _errorMessage = 'Error loading data: ${e.toString()}';
         _isLoading = false;
       });
+    } finally {
+      _isLoadingData = false;
     }
   }
 
@@ -255,7 +333,19 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   }
 
   void _handleSocketOrderEvent(Map<String, dynamic> data) {
+    // Ignore other branches' realtime traffic (defensive — the backend already
+    // emits to per-branch rooms).
     final rawOrderData = data['order'];
+    if (_branchId != null) {
+      final rawBranch = data['branch_id'] ??
+          data['branchId'] ??
+          (rawOrderData is Map
+              ? (rawOrderData['branch_id'] ?? rawOrderData['BRANCH_ID'] ?? rawOrderData['branchId'])
+              : null);
+      final eventBranch =
+          rawBranch is int ? rawBranch : int.tryParse(rawBranch?.toString() ?? '');
+      if (eventBranch != null && eventBranch != _branchId) return;
+    }
     final orderData = rawOrderData is Map
         ? Map<String, dynamic>.from(rawOrderData)
         : Map<String, dynamic>.from(data);
@@ -719,6 +809,76 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     }
 
     await _editOrder(tableOrder);
+  }
+
+  // "Extend Room Charge" button on a VIP/KTV room card — adds one more unit
+  // of the table's room charge onto the active order's service charge.
+  Future<void> _extendRoomChargeForTable(WaiterTable table) async {
+    WaiterOrder? tableOrder;
+    try {
+      tableOrder = _orders.firstWhere(
+        (order) => order.tableId == table.id && (order.status == 2 || order.status == 3),
+      );
+    } catch (_) {
+      tableOrder = null;
+    }
+
+    if (tableOrder == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('No active order to extend for ${table.number}'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+      return;
+    }
+
+    final order = tableOrder;
+    final confirmed = await showExtendRoomChargeConfirm(
+      context,
+      tableName: table.number,
+      orderLabel: order.orderNo ?? '#${order.id}',
+      roomCharge: table.roomCharge,
+      currentRoomCharge: order.serviceCharge,
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    final result = await ApiService.extendRoomCharge(orderId: order.id);
+    if (!mounted) return;
+
+    if (result['success'] == true) {
+      final data = result['data'] as Map<String, dynamic>?;
+      final added = (data?['room_charge_added'] as num?)?.toDouble() ?? table.roomCharge;
+      final newServiceCharge = (data?['service_charge'] as num?)?.toDouble() ??
+          (order.serviceCharge + added);
+      final newTotal = (data?['grand_total'] as num?)?.toDouble() ??
+          (order.grandTotal + added);
+      final units = table.roomCharge > 0
+          ? (newServiceCharge / table.roomCharge).round()
+          : null;
+
+      SystemSound.play(SystemSoundType.alert);
+      HapticFeedback.mediumImpact();
+      await showRoomChargeExtendedResult(
+        context,
+        tableName: table.number,
+        added: added,
+        newRoomCharge: newServiceCharge,
+        newGrandTotal: newTotal,
+        units: units,
+      );
+      if (!mounted) return;
+      await _loadData(showSpinner: false);
+    } else {
+      SystemSound.play(SystemSoundType.alert);
+      await showExtendRoomChargeError(
+        context,
+        result['error']?.toString() ?? 'Failed to extend room charge',
+      );
+    }
   }
 
   void _showTableOrderDetails(WaiterTable table) {
@@ -1574,7 +1734,15 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       return Scaffold(
         backgroundColor: const Color(0xFFF5F6F0),
         appBar: AppBar(
-          title: const Text('Waiter App'),
+          title: Text(
+            'WAITER DASHBOARD',
+            style: GoogleFonts.urbanist(
+              fontWeight: FontWeight.w900,
+              letterSpacing: 2,
+              fontSize: 18,
+              color: const Color(0xFF1A1C18),
+            ),
+          ),
         ),
         body: const Center(
           child: CircularProgressIndicator(
@@ -1588,7 +1756,15 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       return Scaffold(
         backgroundColor: const Color(0xFFF5F6F0),
         appBar: AppBar(
-          title: const Text('Waiter App'),
+          title: Text(
+            'WAITER DASHBOARD',
+            style: GoogleFonts.urbanist(
+              fontWeight: FontWeight.w900,
+              letterSpacing: 2,
+              fontSize: 18,
+              color: const Color(0xFF1A1C18),
+            ),
+          ),
         ),
         body: Center(
           child: Column(
@@ -1768,6 +1944,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                         },
                         onAddOrder: _addOrderForTable,
                         onEditOrder: _editOrderForTable,
+                        onExtendRoomCharge: _extendRoomChargeForTable,
                       ),
                       NewOrdersTab(
                         orders: newOrders,
@@ -1794,9 +1971,29 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                     backgroundColor: Colors.transparent,
                     elevation: 0,
                     scrolledUnderElevation: 0,
-                    title: const Text('Waiter App'),
+                    title: Text(
+            'WAITER DASHBOARD',
+            style: GoogleFonts.urbanist(
+              fontWeight: FontWeight.w900,
+              letterSpacing: 2,
+              fontSize: 18,
+              color: const Color(0xFF1A1C18),
+            ),
+          ),
                     actions: [
                       IconButton(
+                        tooltip: 'Refresh',
+                        onPressed: _isManualRefreshing ? null : _manualRefresh,
+                        icon: _isManualRefreshing
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.refresh),
+                      ),
+                      IconButton(
+                        tooltip: 'Logout',
                         onPressed: logout,
                         icon: const Icon(Icons.logout),
                       ),
@@ -1866,6 +2063,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                           isLandscape: isLandscape,
                           newOrdersCount: newOrdersCount,
                           orderListCount: activeOrderCount,
+                          onRefresh: _manualRefresh,
                           onOpenSettings: () {
                             showAppSettingsSheet(
                               context: context,

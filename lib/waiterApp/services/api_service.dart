@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
 import '../../shared/globals.dart';
+import 'socket_service.dart';
 
 class ApiService {
   // Cached base URL to avoid repeated async calls
@@ -81,6 +82,16 @@ class ApiService {
         if (data['data']['table_id'] != null) {
           await prefs.setString('table_id', data['data']['table_id'].toString());
         }
+        // Branch — needed so realtime socket rooms and event filtering stay
+        // scoped to this user's branch.
+        if (data['data']['branch_id'] != null) {
+          await prefs.setString('branch_id', data['data']['branch_id'].toString());
+        } else {
+          await prefs.remove('branch_id');
+        }
+        if (data['data']['branch_name'] != null) {
+          await prefs.setString('branch_name', data['data']['branch_name'].toString());
+        }
         // Save JWT tokens for authentication
         if (data['tokens'] != null) {
           await prefs.setString('access_token', data['tokens']['accessToken'] ?? '');
@@ -144,6 +155,11 @@ class ApiService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
     await prefs.setBool('is_logged_in', false);
+    _cachedBaseUrl = null;
+    // Tear the socket all the way down so the next login always starts a
+    // brand-new connection (fresh branch id, no leftover reconnection state
+    // from a session that never managed to connect).
+    SocketService.disconnect();
   }
 
   // Get authentication headers
@@ -173,7 +189,16 @@ class ApiService {
       'permissions': prefs.getString('permissions'),
       'role': prefs.getString('role'),
       'table_id': prefs.getString('table_id'),
+      'branch_id': prefs.getString('branch_id'),
+      'branch_name': prefs.getString('branch_name'),
     };
+  }
+
+  /// This user's branch id, or null for multi-branch/admin accounts.
+  static Future<int?> getBranchId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('branch_id');
+    return raw == null ? null : int.tryParse(raw);
   }
 
   // Get all categories
@@ -270,7 +295,14 @@ class ApiService {
   static List<dynamic>? get cachedTopRevenueRaw => _cachedTopRevenueResponse?['data'] as List<dynamic>?;
 
   // Get top revenue / popular menu items (matches Sales Analytics top revenue)
+  // Set once the backend answers /api/menu/top-revenue with 404/501 (older
+  // server without the route) so we stop re-probing it every couple of minutes.
+  static bool _topRevenueEndpointMissing = false;
+
   static Future<Map<String, dynamic>> getTopRevenueItems({int limit = 20, bool forceRefresh = false}) async {
+    if (_topRevenueEndpointMissing && !forceRefresh) {
+      return {'success': false, 'error': 'top-revenue endpoint unavailable', 'unavailable': true};
+    }
     if (!forceRefresh && _cachedTopRevenueResponse != null && _cachedTopRevenueTime != null) {
       if (DateTime.now().difference(_cachedTopRevenueTime!).inMinutes < 2) {
         return _cachedTopRevenueResponse!;
@@ -293,6 +325,11 @@ class ApiService {
           'error': 'Session expired. Please login again.',
           'unauthorized': true,
         };
+      }
+
+      if (response.statusCode == 404 || response.statusCode == 501) {
+        _topRevenueEndpointMissing = true;
+        return {'success': false, 'error': 'top-revenue endpoint unavailable', 'unavailable': true};
       }
 
       final data = jsonDecode(response.body);
@@ -493,6 +530,46 @@ class ApiService {
       return {
         'success': false,
         'error': data['error'] ?? 'Failed to transfer table order',
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Connection error: ${e.toString()}',
+      };
+    }
+  }
+
+  // Extend room charge — adds one more unit of the table's room charge to the
+  // order's service charge and recomputes the grand total.
+  static Future<Map<String, dynamic>> extendRoomCharge({
+    required int orderId,
+  }) async {
+    try {
+      final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/extend-room-charge');
+      final headers = await getAuthHeaders();
+
+      final response = await http.post(url, headers: headers);
+
+      if (response.statusCode == 401) {
+        await logout();
+        return {
+          'success': false,
+          'error': 'Session expired. Please login again.',
+          'unauthorized': true,
+        };
+      }
+
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['success'] == true) {
+        return {
+          'success': true,
+          'data': data['data'],
+        };
+      }
+
+      return {
+        'success': false,
+        'error': data['error'] ?? 'Failed to extend room charge',
       };
     } catch (e) {
       return {

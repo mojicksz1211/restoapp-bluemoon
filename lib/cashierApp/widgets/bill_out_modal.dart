@@ -27,6 +27,18 @@ class BillOutModal extends StatelessWidget {
     );
   }
 
+  /// How many room-charge units the service charge represents, when it
+  /// divides evenly into the table's base ROOM_CHARGE; null otherwise.
+  int? get _roomChargeUnits {
+    final rate = order.roomCharge;
+    final total = order.serviceCharge;
+    if (rate <= 0 || total <= 0) return null;
+    final q = total / rate;
+    final rounded = q.round();
+    if (rounded >= 1 && (q - rounded).abs() < 0.01) return rounded;
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     const navy = Color(0xFF0C0E2B);
@@ -230,15 +242,27 @@ class BillOutModal extends StatelessWidget {
                             children: [
                               Expanded(
                                 flex: 5,
-                                child: Text(
-                                  'Room Charge (${order.tableNumber ?? 'VIP Room'})',
-                                  style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 14, color: const Color(0xFFD97706)),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Room Charge (${order.tableNumber ?? 'VIP Room'})',
+                                      style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 14, color: const Color(0xFFD97706)),
+                                    ),
+                                    if (_roomChargeUnits != null && order.roomCharge > 0)
+                                      Text(
+                                        _roomChargeUnits! > 1
+                                            ? 'Base ₱${_formatCurrency(order.roomCharge)} + ${_roomChargeUnits! - 1} extension${_roomChargeUnits! - 1 == 1 ? '' : 's'}  (₱${_formatCurrency(order.roomCharge)} × ${_roomChargeUnits!})'
+                                            : 'Base rate ₱${_formatCurrency(order.roomCharge)}',
+                                        style: GoogleFonts.urbanist(fontWeight: FontWeight.w600, fontSize: 11, color: Colors.grey.shade500),
+                                      ),
+                                  ],
                                 ),
                               ),
                               Expanded(
                                 flex: 2,
                                 child: Text(
-                                  '1',
+                                  '${_roomChargeUnits ?? 1}',
                                   textAlign: TextAlign.center,
                                   style: GoogleFonts.urbanist(fontWeight: FontWeight.w900, fontSize: 14.5, color: const Color(0xFFD97706)),
                                 ),
@@ -266,7 +290,9 @@ class BillOutModal extends StatelessWidget {
                         _buildSummaryRow('Items Subtotal:', '₱${_formatCurrency(itemsSubtotal)}'),
                         const SizedBox(height: 6),
                         _buildSummaryRow(
-                          'Room Charge:',
+                          _roomChargeUnits != null && _roomChargeUnits! > 1 && order.roomCharge > 0
+                              ? 'Room Charge (₱${_formatCurrency(order.roomCharge)} × ${_roomChargeUnits!}):'
+                              : 'Room Charge:',
                           '₱${_formatCurrency(roomCharge)}',
                           valueColor: const Color(0xFFD97706),
                         ),

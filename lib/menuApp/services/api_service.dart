@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
 import '../../shared/globals.dart';
+import 'socket_service.dart';
 
 class ApiService {
   // Cached base URL to avoid repeated async calls
@@ -79,6 +80,15 @@ class ApiService {
         if (data['data']['table_id'] != null) {
           await prefs.setString('table_id', data['data']['table_id'].toString());
         }
+        // Branch — keeps realtime socket rooms scoped to this user's branch.
+        if (data['data']['branch_id'] != null) {
+          await prefs.setString('branch_id', data['data']['branch_id'].toString());
+        } else {
+          await prefs.remove('branch_id');
+        }
+        if (data['data']['branch_name'] != null) {
+          await prefs.setString('branch_name', data['data']['branch_name'].toString());
+        }
         // Save JWT tokens for authentication
         if (data['tokens'] != null) {
           await prefs.setString('access_token', data['tokens']['accessToken'] ?? '');
@@ -142,6 +152,11 @@ class ApiService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
     await prefs.setBool('is_logged_in', false);
+    _cachedBaseUrl = null;
+    // Tear the socket all the way down so the next login always starts a
+    // brand-new connection (fresh branch id, no leftover reconnection state
+    // from a session that never managed to connect).
+    SocketService.disconnect();
   }
 
   // Get authentication headers
@@ -171,7 +186,16 @@ class ApiService {
       'permissions': prefs.getString('permissions'),
       'role': prefs.getString('role'),
       'table_id': prefs.getString('table_id'),
+      'branch_id': prefs.getString('branch_id'),
+      'branch_name': prefs.getString('branch_name'),
     };
+  }
+
+  /// This user's branch id, or null for multi-branch/admin accounts.
+  static Future<int?> getBranchId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('branch_id');
+    return raw == null ? null : int.tryParse(raw);
   }
 
   // Get all categories

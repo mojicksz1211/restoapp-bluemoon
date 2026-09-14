@@ -18,6 +18,7 @@ import '../widgets/center_popup.dart';
 import '../widgets/item_note_modal.dart';
 import '../widgets/quick_add_drinks_carousel.dart';
 import '../widgets/fire_glow_background.dart';
+import '../../shared/widgets/offline_sync_banner.dart';
 
 class GetOrderPage extends StatefulWidget {
   final WaiterTable table;
@@ -1745,13 +1746,20 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
           _cart.clear();
         });
         WaiterCartStore.instance.clear(_cartKey);
+        final isOffline = result['is_offline'] == true;
         showCenterPopup(
           context,
-          icon: Icons.check_circle,
-          accentColor: Colors.green,
-          title: 'Order Placed Successfully!',
-          subtitle: 'Order #${result['data']?['order_no'] ?? orderNo}',
+          icon: isOffline ? Icons.cloud_off_rounded : Icons.check_circle,
+          accentColor: isOffline ? const Color(0xFFD97706) : Colors.green,
+          title: isOffline ? 'Order Saved Locally (Offline)' : 'Order Placed Successfully!',
+          subtitle: isOffline
+              ? 'Order #${result['data']?['order_no'] ?? orderNo} saved to device. Will auto-sync once WiFi has internet.'
+              : 'Order #${result['data']?['order_no'] ?? orderNo}',
         );
+        // The popup lives in the root overlay (see showCenterPopup) so it keeps
+        // showing even after this page pops — redirect back to the dashboard
+        // same as the "add items to existing order" flow below.
+        Navigator.pop(context);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -1836,16 +1844,19 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
 
       if (result['success'] == true) {
         final itemCount = _cart.length;
+        final isOffline = result['is_offline'] == true;
         setState(() {
           _cart.clear();
         });
         WaiterCartStore.instance.clear(_cartKey);
         showCenterPopup(
           context,
-          icon: Icons.check_circle,
-          accentColor: Colors.green,
-          title: 'Items Added Successfully!',
-          subtitle: '$itemCount item(s) added to order #${widget.existingOrder!.orderNo ?? widget.existingOrder!.id}',
+          icon: isOffline ? Icons.cloud_off_rounded : Icons.check_circle,
+          accentColor: isOffline ? const Color(0xFFD97706) : Colors.green,
+          title: isOffline ? 'Items Added Locally (Offline)' : 'Items Added Successfully!',
+          subtitle: isOffline
+              ? '$itemCount item(s) saved locally to order. Will auto-sync when online.'
+              : '$itemCount item(s) added to order #${widget.existingOrder!.orderNo ?? widget.existingOrder!.id}',
         );
         Navigator.pop(context);
       } else {
@@ -1987,6 +1998,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         child: isMobile
             ? Column(
                 children: [
+                  const OfflineSyncBanner(),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(14, 8, 14, 6),
                     child: Container(

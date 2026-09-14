@@ -22,6 +22,8 @@ import 'services/notification_service.dart';
 import 'pages/get_order_page.dart';
 import 'pages/tables_tab.dart';
 import 'pages/new_orders_tab.dart';
+import '../shared/offline_sync_service.dart';
+import '../shared/widgets/offline_sync_banner.dart';
 
 class WaiterHomePage extends StatefulWidget {
   const WaiterHomePage({super.key});
@@ -65,12 +67,20 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   void initState() {
     super.initState();
     WaiterCartStore.instance.restore();
+    OfflineSyncService.instance.addDataSyncedListener(_onDataSynced);
     _loadBranchId();
     _loadData();
     _initializeSocket();
     _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (mounted && !SocketService.isConnected) _pollData();
     });
+  }
+
+  void _onDataSynced() {
+    if (mounted) {
+      debugPrint('[WAITER] Sync completed event received, refreshing data...');
+      _loadData(showSpinner: false);
+    }
   }
 
   Future<void> _loadBranchId() async {
@@ -87,6 +97,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
   @override
   void dispose() {
+    OfflineSyncService.instance.removeDataSyncedListener(_onDataSynced);
     _pollTimer?.cancel();
     _cleanupSocket();
     super.dispose();
@@ -203,14 +214,18 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
         unawaited(ApiService.getTopRevenueItems(limit: 15));
       } else {
         setState(() {
-          _errorMessage =
-              tablesResult['error'] ?? ordersResult['error'] ?? menuResult['error'];
+          if (_tables.isEmpty && _menuItems.isEmpty) {
+            _errorMessage =
+                tablesResult['error'] ?? ordersResult['error'] ?? menuResult['error'];
+          }
           _isLoading = false;
         });
       }
     } catch (e) {
       setState(() {
-        _errorMessage = 'Error loading data: ${e.toString()}';
+        if (_tables.isEmpty && _menuItems.isEmpty) {
+          _errorMessage = 'Error loading data: ${e.toString()}';
+        }
         _isLoading = false;
       });
     } finally {
@@ -301,6 +316,11 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   Future<void> _initializeSocket() async {
     try {
       await SocketService.initialize();
+      // Join the waiter role room — table_updated events (e.g. a table freed
+      // when the cashier settles its bill) are broadcast ONLY to the role
+      // rooms, never to the per-order rooms this screen subscribes to. Without
+      // this the dashboard never sees a table go back to Available in realtime.
+      SocketService.joinWaiter();
 
       _disposeOrderUpdated?.call();
       _disposeOrderUpdated = SocketService.addOrderUpdateListener((data) {
@@ -836,7 +856,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     }
 
     final order = tableOrder;
-    final confirmed = await showExtendRoomChargeConfirm(
+    final qty = await showExtendRoomChargeConfirm(
       context,
       tableName: table.number,
       orderLabel: order.orderNo ?? '#${order.id}',
@@ -844,9 +864,9 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       currentRoomCharge: order.serviceCharge,
     );
 
-    if (confirmed != true || !mounted) return;
+    if (qty == null || qty <= 0 || !mounted) return;
 
-    final result = await ApiService.extendRoomCharge(orderId: order.id);
+    final result = await ApiService.extendRoomCharge(orderId: order.id, qty: qty);
     if (!mounted) return;
 
     if (result['success'] == true) {
@@ -857,7 +877,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       final newTotal = (data?['grand_total'] as num?)?.toDouble() ??
           (order.grandTotal + added);
       final units = table.roomCharge > 0
-          ? (newServiceCharge / table.roomCharge).round()
+          ? (newServiceCharge / table.roomCharge * 2).round() / 2
           : null;
 
       SystemSound.play(SystemSoundType.alert);
@@ -2032,49 +2052,56 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                     ),
                   )
                 : null,
-            body: isMobile
-                ? mainContent
-                : Row(
-                    children: [
-                      AnimatedBuilder(
-                        animation: controller,
-                        builder: (context, _) => WaiterSidebar(
-                          selectedIndex: controller.index,
-                          onSelect: (index) {
-                            // Tapping "Tables" itself (not its Occupied/
-                            // Available sub-rows) means "show everything".
-                            if (index == 0) {
-                              setState(() => _tableFilter = 'all');
-                            }
-                            controller.animateTo(index);
-                          },
-                          tableFilter: _tableFilter,
-                          onSelectTableFilter: (filter) {
-                            setState(() => _tableFilter = filter);
-                            controller.animateTo(0);
-                          },
-                          width: isMobile
-                              ? 200
-                              : (mediaQuery.size.width < 750
-                                  ? 190
-                                  : (mediaQuery.size.width < 1000
-                                      ? 220
-                                      : (isLandscape ? 240 : 270))),
-                          isLandscape: isLandscape,
-                          newOrdersCount: newOrdersCount,
-                          orderListCount: activeOrderCount,
-                          onRefresh: _manualRefresh,
-                          onOpenSettings: () {
-                            showAppSettingsSheet(
-                              context: context,
-                              onLogout: logout,
-                            );
-                          },
+            body: Column(
+              children: [
+                const OfflineSyncBanner(),
+                Expanded(
+                  child: isMobile
+                      ? mainContent
+                      : Row(
+                          children: [
+                            AnimatedBuilder(
+                              animation: controller,
+                              builder: (context, _) => WaiterSidebar(
+                                selectedIndex: controller.index,
+                                onSelect: (index) {
+                                  // Tapping "Tables" itself (not its Occupied/
+                                  // Available sub-rows) means "show everything".
+                                  if (index == 0) {
+                                    setState(() => _tableFilter = 'all');
+                                  }
+                                  controller.animateTo(index);
+                                },
+                                tableFilter: _tableFilter,
+                                onSelectTableFilter: (filter) {
+                                  setState(() => _tableFilter = filter);
+                                  controller.animateTo(0);
+                                },
+                                width: isMobile
+                                    ? 200
+                                    : (mediaQuery.size.width < 750
+                                        ? 190
+                                        : (mediaQuery.size.width < 1000
+                                            ? 220
+                                            : (isLandscape ? 240 : 270))),
+                                isLandscape: isLandscape,
+                                newOrdersCount: newOrdersCount,
+                                orderListCount: activeOrderCount,
+                                onRefresh: _manualRefresh,
+                                onOpenSettings: () {
+                                  showAppSettingsSheet(
+                                    context: context,
+                                    onLogout: logout,
+                                  );
+                                },
+                              ),
+                            ),
+                            Expanded(child: mainContent),
+                          ],
                         ),
-                      ),
-                      Expanded(child: mainContent),
-                    ],
-                  ),
+                ),
+              ],
+            ),
           );
         },
       ),

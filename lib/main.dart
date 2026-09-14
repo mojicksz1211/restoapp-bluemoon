@@ -10,9 +10,17 @@ import 'kitchenApp/kitchen_app.dart';
 import 'menuApp/services/api_service.dart';
 import 'shared/login_page.dart';
 import 'shared/globals.dart';
+import 'shared/offline_sync_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize offline caching and auto-sync service
+  try {
+    await OfflineSyncService.instance.initialize();
+  } catch (e) {
+    debugPrint('OfflineSyncService init error: $e');
+  }
 
   // Enable fullscreen mode for Android (hide status bar and navigation bar)
   // Skip on web since Platform.isAndroid doesn't work there

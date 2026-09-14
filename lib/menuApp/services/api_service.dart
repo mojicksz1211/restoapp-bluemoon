@@ -354,6 +354,10 @@ class ApiService {
         return {
           'success': false,
           'error': data['error'] ?? 'Failed to create order',
+          // Table already has an open order server-side (e.g. a waiter started one
+          // for this table on another device): caller should append to it instead.
+          if (data['code'] == 'ACTIVE_ORDER_EXISTS') 'code': data['code'],
+          if (data['existing_order_id'] != null) 'existing_order_id': data['existing_order_id'],
         };
       }
     } catch (e) {

@@ -8,40 +8,154 @@ const _navy = Color(0xFF0C0E2B);
 const _navyLight = Color(0xFF1B1E4A);
 const _gold = Color(0xFFE8C468);
 
-/// Confirmation shown before extending a room's charge. Returns `true` when
-/// the waiter confirms.
-Future<bool?> showExtendRoomChargeConfirm(
+/// Confirmation shown before extending a room's charge. Lets the waiter pick
+/// a qty in 0.5 steps (same as admin's manual-order room charge stepper).
+/// Returns the confirmed qty, or `null` when cancelled.
+Future<double?> showExtendRoomChargeConfirm(
   BuildContext context, {
   required String tableName,
   required String orderLabel,
   required double roomCharge,
   required double currentRoomCharge,
 }) {
-  return showDialog<bool>(
+  return showDialog<double>(
     context: context,
-    builder: (ctx) => _ExtendDialogShell(
+    builder: (ctx) => _ExtendQtyDialog(
+      tableName: tableName,
+      orderLabel: orderLabel,
+      roomCharge: roomCharge,
+      currentRoomCharge: currentRoomCharge,
+    ),
+  );
+}
+
+String _fmtQty(double v) => v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(1);
+
+class _ExtendQtyDialog extends StatefulWidget {
+  final String tableName;
+  final String orderLabel;
+  final double roomCharge;
+  final double currentRoomCharge;
+
+  const _ExtendQtyDialog({
+    required this.tableName,
+    required this.orderLabel,
+    required this.roomCharge,
+    required this.currentRoomCharge,
+  });
+
+  @override
+  State<_ExtendQtyDialog> createState() => _ExtendQtyDialogState();
+}
+
+class _ExtendQtyDialogState extends State<_ExtendQtyDialog> {
+  double _qty = 0.5;
+
+  @override
+  Widget build(BuildContext context) {
+    final additional = widget.roomCharge * _qty;
+    return _ExtendDialogShell(
       icon: Icons.more_time_rounded,
       showLogo: true,
       title: 'Extend Room Charge',
       accent: _gold,
-      subtitle: '$tableName • $orderLabel',
-      body: _BreakdownBox(
-        rows: [
-          _BreakdownRow('Current room charge', '₱${formatPrice(currentRoomCharge)}'),
-          _BreakdownRow('Additional session', '+ ₱${formatPrice(roomCharge)}', accent: true),
-          _BreakdownRow(
-            'Total Room Charge',
-            '₱${formatPrice(currentRoomCharge + roomCharge)}',
-            emphasize: true,
+      subtitle: '${widget.tableName} • ${widget.orderLabel}',
+      body: Column(
+        children: [
+          _QtyStepper(
+            qty: _qty,
+            onDecrement: _qty > 0.5 ? () => setState(() => _qty -= 0.5) : null,
+            onIncrement: () => setState(() => _qty += 0.5),
+          ),
+          const SizedBox(height: 16),
+          _BreakdownBox(
+            rows: [
+              _BreakdownRow('Current room charge', '₱${formatPrice(widget.currentRoomCharge)}'),
+              _BreakdownRow(
+                _qty == 1 ? 'Additional session' : 'Additional session (×${_fmtQty(_qty)})',
+                '+ ₱${formatPrice(additional)}',
+                accent: true,
+              ),
+              _BreakdownRow(
+                'Total Room Charge',
+                '₱${formatPrice(widget.currentRoomCharge + additional)}',
+                emphasize: true,
+              ),
+            ],
           ),
         ],
       ),
       primaryLabel: 'Extend',
-      onPrimary: () => Navigator.of(ctx).pop(true),
+      onPrimary: () => Navigator.of(context).pop(_qty),
       secondaryLabel: 'Cancel',
-      onSecondary: () => Navigator.of(ctx).pop(false),
-    ),
-  );
+      onSecondary: () => Navigator.of(context).pop(),
+    );
+  }
+}
+
+class _QtyStepper extends StatelessWidget {
+  final double qty;
+  final VoidCallback? onDecrement;
+  final VoidCallback onIncrement;
+
+  const _QtyStepper({required this.qty, required this.onDecrement, required this.onIncrement});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(
+          'Qty',
+          style: GoogleFonts.urbanist(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: Colors.white.withValues(alpha: 0.7),
+          ),
+        ),
+        const SizedBox(width: 16),
+        _StepperButton(icon: Icons.remove_rounded, onTap: onDecrement),
+        SizedBox(
+          width: 48,
+          child: Text(
+            _fmtQty(qty),
+            textAlign: TextAlign.center,
+            style: GoogleFonts.urbanist(fontSize: 18, fontWeight: FontWeight.w900, color: Colors.white),
+          ),
+        ),
+        _StepperButton(icon: Icons.add_rounded, onTap: onIncrement),
+      ],
+    );
+  }
+}
+
+class _StepperButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  const _StepperButton({required this.icon, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onTap != null;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            color: _gold.withValues(alpha: enabled ? 0.16 : 0.06),
+            border: Border.all(color: _gold.withValues(alpha: enabled ? 0.5 : 0.15)),
+          ),
+          child: Icon(icon, size: 18, color: _gold.withValues(alpha: enabled ? 1 : 0.3)),
+        ),
+      ),
+    );
+  }
 }
 
 /// Success dialog after a room charge is extended.
@@ -51,8 +165,9 @@ Future<void> showRoomChargeExtendedResult(
   required double added,
   required double newRoomCharge,
   required double newGrandTotal,
-  int? units,
+  double? units,
 }) {
+  final unitsLabel = units != null && units % 1 == 0 ? units.toInt().toString() : units?.toStringAsFixed(1);
   return showDialog<void>(
     context: context,
     builder: (ctx) => _ExtendDialogShell(
@@ -61,7 +176,7 @@ Future<void> showRoomChargeExtendedResult(
       title: 'Room Charge Extended',
       accent: _gold,
       subtitle: units != null && units > 1
-          ? '$tableName • now ×$units sessions'
+          ? '$tableName • now ×$unitsLabel sessions'
           : tableName,
       body: _BreakdownBox(
         rows: [

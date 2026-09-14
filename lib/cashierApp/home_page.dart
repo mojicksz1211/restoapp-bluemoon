@@ -13,6 +13,8 @@ import 'widgets/bill_out_modal.dart';
 import '../waiterApp/widgets/transfer_table_modal.dart';
 import '../shared/settings_sheet.dart';
 import '../shared/app_translations.dart';
+import '../shared/offline_sync_service.dart';
+import '../shared/widgets/offline_sync_banner.dart';
 
 class SettlementData {
   final String paymentMethod;
@@ -244,6 +246,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
   @override
   void initState() {
     super.initState();
+    OfflineSyncService.instance.addDataSyncedListener(_onDataSynced);
     _loadData();
     _initializeSocket();
     languageNotifier.addListener(_onLanguageChanged);
@@ -260,6 +263,13 @@ class _CashierHomePageState extends State<CashierHomePage> {
     });
   }
 
+  void _onDataSynced() {
+    if (mounted) {
+      debugPrint('[CASHIER] Sync completed event received, refreshing data...');
+      _loadData(showSpinner: false);
+    }
+  }
+
   void _onLanguageChanged() {
     if (mounted) {
       _loadData();
@@ -268,6 +278,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
   @override
   void dispose() {
+    OfflineSyncService.instance.removeDataSyncedListener(_onDataSynced);
     SoundService.stopRepeatingAlert();
     languageNotifier.removeListener(_onLanguageChanged);
     _socketRefreshTimer?.cancel();
@@ -324,13 +335,17 @@ class _CashierHomePageState extends State<CashierHomePage> {
         _syncSocketOrderRooms();
       } else {
         setState(() {
-          _errorMessage = ordersResult['error'] ?? 'Failed to load orders';
+          if (_orders.isEmpty && _tables.isEmpty) {
+            _errorMessage = ordersResult['error'] ?? 'Failed to load orders';
+          }
           _isLoading = false;
         });
       }
     } catch (e) {
       setState(() {
-        _errorMessage = 'Error loading data: ${e.toString()}';
+        if (_orders.isEmpty && _tables.isEmpty) {
+          _errorMessage = 'Error loading data: ${e.toString()}';
+        }
         _isLoading = false;
       });
       debugPrint('❌ Error in _loadData: $e');
@@ -719,8 +734,16 @@ class _CashierHomePageState extends State<CashierHomePage> {
       if (result['success'] == true) {
         await _loadData(showSpinner: false);
         if (mounted && _unacknowledgedOrderIds.isEmpty) {
+          final isOffline = result['is_offline'] == true;
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Order settled successfully'), backgroundColor: Colors.green),
+            SnackBar(
+              content: Text(
+                isOffline
+                    ? 'Order settled locally (Offline). Will auto-sync when online.'
+                    : 'Order settled successfully',
+              ),
+              backgroundColor: isOffline ? const Color(0xFFD97706) : Colors.green,
+            ),
           );
         }
       } else {
@@ -1110,22 +1133,29 @@ class _CashierHomePageState extends State<CashierHomePage> {
                   ),
           ),
         ),
-        body: Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFFF5F6F0),
-            image: DecorationImage(
-              image: AssetImage('assets/images/menubackground.png'),
-              fit: BoxFit.cover,
-              opacity: 0.15,
+        body: Column(
+          children: [
+            const OfflineSyncBanner(),
+            Expanded(
+              child: Container(
+                decoration: const BoxDecoration(
+                  color: Color(0xFFF5F6F0),
+                  image: DecorationImage(
+                    image: AssetImage('assets/images/menubackground.png'),
+                    fit: BoxFit.cover,
+                    opacity: 0.15,
+                  ),
+                ),
+                child: TabBarView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  children: [
+                    _buildOrderList(_filterAndSortOrders(unsettledOrders), isHistory: false),
+                    _buildOrderList(_filterOrders(settledOrders), isHistory: true),
+                  ],
+                ),
+              ),
             ),
-          ),
-          child: TabBarView(
-            physics: const AlwaysScrollableScrollPhysics(),
-            children: [
-              _buildOrderList(_filterAndSortOrders(unsettledOrders), isHistory: false),
-              _buildOrderList(_filterOrders(settledOrders), isHistory: true),
-            ],
-          ),
+          ],
         ),
       ),
       if (_alertOrdersQueue.isNotEmpty)
@@ -2934,17 +2964,20 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
   }
 
   // How many room-charge units the current service charge represents, when
-  // it divides evenly into the base rate; null when it doesn't (e.g. an
-  // extra manual service charge was mixed in) so we just show the total.
-  int? get _roomChargeUnits {
+  // it divides evenly into the base rate (in 0.5 steps, to match the
+  // half-session qty admin's manual order can create); null when it doesn't
+  // (e.g. an extra manual service charge was mixed in) so we just show the total.
+  double? get _roomChargeUnits {
     final rate = _roomChargeRate;
     final total = widget.order.serviceCharge;
     if (rate <= 0 || total <= 0) return null;
     final q = total / rate;
-    final rounded = q.round();
-    if (rounded >= 1 && (q - rounded).abs() < 0.01) return rounded;
+    final rounded = (q * 2).round() / 2;
+    if (rounded >= 0.5 && (q - rounded).abs() < 0.01) return rounded;
     return null;
   }
+
+  String _formatRoomChargeUnits(double v) => v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(1);
 
   @override
   Widget build(BuildContext context) {
@@ -3282,7 +3315,7 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                                                 borderRadius: BorderRadius.circular(4),
                                               ),
                                               child: Text(
-                                                '×$units',
+                                                '×${_formatRoomChargeUnits(units)}',
                                                 style: GoogleFonts.urbanist(
                                                   fontSize: 11,
                                                   fontWeight: FontWeight.w900,
@@ -3296,7 +3329,7 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                                       if (showBreakdown)
                                         Text(
                                           units > 1
-                                              ? 'Base ₱${formatPrice(rate)} + ${units - 1} extension${units - 1 == 1 ? '' : 's'} (₱${formatPrice(rate)} × $units)'
+                                              ? 'Base ₱${formatPrice(rate)} + ${_formatRoomChargeUnits(units - 1)} extension${units - 1 == 1 ? '' : 's'} (₱${formatPrice(rate)} × ${_formatRoomChargeUnits(units)})'
                                               : 'Base rate ₱${formatPrice(rate)}',
                                           style: GoogleFonts.urbanist(
                                             fontSize: 11,
@@ -3576,17 +3609,21 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
   double _cashTendered = 0.0;
 
   // How many room-charge units the service charge represents, when it divides
-  // evenly into the table's base ROOM_CHARGE; null otherwise. Lets the sheet
-  // spell out WHY the room charge total is what it is after extensions.
-  int? get _roomChargeUnits {
+  // evenly into the table's base ROOM_CHARGE (in 0.5 steps, to match the
+  // half-session qty admin's manual order can create); null otherwise. Lets
+  // the sheet spell out WHY the room charge total is what it is after
+  // extensions.
+  double? get _roomChargeUnits {
     final rate = widget.order.roomCharge;
     final total = widget.order.serviceCharge;
     if (rate <= 0 || total <= 0) return null;
     final q = total / rate;
-    final rounded = q.round();
-    if (rounded >= 1 && (q - rounded).abs() < 0.01) return rounded;
+    final rounded = (q * 2).round() / 2;
+    if (rounded >= 0.5 && (q - rounded).abs() < 0.01) return rounded;
     return null;
   }
+
+  String _formatRoomChargeUnits(double v) => v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(1);
 
   @override
   void initState() {
@@ -3817,14 +3854,14 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                                     children: [
                                       Text(
                                         _roomChargeUnits != null && _roomChargeUnits! > 1
-                                            ? 'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})  ×${_roomChargeUnits!}'
+                                            ? 'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})  ×${_formatRoomChargeUnits(_roomChargeUnits!)}'
                                             : 'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})',
                                         style: GoogleFonts.urbanist(fontSize: 14.5, fontWeight: FontWeight.w800, color: const Color(0xFFD97706)),
                                       ),
                                       if (_roomChargeUnits != null && widget.order.roomCharge > 0)
                                         Text(
                                           _roomChargeUnits! > 1
-                                              ? 'Base ₱${formatPrice(widget.order.roomCharge)} + ${_roomChargeUnits! - 1} extension${_roomChargeUnits! - 1 == 1 ? '' : 's'}  (₱${formatPrice(widget.order.roomCharge)} × ${_roomChargeUnits!})'
+                                              ? 'Base ₱${formatPrice(widget.order.roomCharge)} + ${_formatRoomChargeUnits(_roomChargeUnits! - 1)} extension${_roomChargeUnits! - 1 == 1 ? '' : 's'}  (₱${formatPrice(widget.order.roomCharge)} × ${_formatRoomChargeUnits(_roomChargeUnits!)})'
                                               : 'Base rate ₱${formatPrice(widget.order.roomCharge)}',
                                           style: GoogleFonts.urbanist(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.grey.shade500),
                                         ),
@@ -3854,7 +3891,7 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                             children: [
                               Text(
                                 _roomChargeUnits != null && _roomChargeUnits! > 1 && widget.order.roomCharge > 0
-                                    ? 'Room Charge (₱${formatPrice(widget.order.roomCharge)} × ${_roomChargeUnits!})'
+                                    ? 'Room Charge (₱${formatPrice(widget.order.roomCharge)} × ${_formatRoomChargeUnits(_roomChargeUnits!)})'
                                     : 'Room Charge',
                                 style: GoogleFonts.urbanist(fontSize: 13.5, fontWeight: FontWeight.w700, color: const Color(0xFFD97706)),
                               ),

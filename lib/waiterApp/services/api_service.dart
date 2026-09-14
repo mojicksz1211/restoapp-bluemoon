@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
 import '../../shared/globals.dart';
+import '../../shared/offline_sync_service.dart';
 import 'socket_service.dart';
 
 class ApiService {
@@ -205,13 +208,8 @@ class ApiService {
   static Future<Map<String, dynamic>> getCategories() async {
     try {
       final url = await _buildUriWithLanguage('${await baseUrl}/api/categories');
-      
       final headers = await getAuthHeaders();
-      
-      final response = await http.get(
-        url,
-        headers: headers,
-      );
+      final response = await http.get(url, headers: headers);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -226,17 +224,27 @@ class ApiService {
       final data = jsonDecode(response.body);
 
       if (response.statusCode == 200 && data['success'] == true) {
+        final catList = List<Map<String, dynamic>>.from(data['data']);
+        unawaited(OfflineSyncService.instance.saveCachedCategories(catList));
         return {
           'success': true,
-          'data': data['data'],
+          'data': catList,
         };
       } else {
+        final cached = await OfflineSyncService.instance.getCachedCategories();
+        if (cached != null && cached.isNotEmpty) {
+          return {'success': true, 'data': cached, 'is_offline': true};
+        }
         return {
           'success': false,
           'error': data['error'] ?? 'Failed to fetch categories',
         };
       }
     } catch (e) {
+      final cached = await OfflineSyncService.instance.getCachedCategories();
+      if (cached != null && cached.isNotEmpty) {
+        return {'success': true, 'data': cached, 'is_offline': true};
+      }
       return {
         'success': false,
         'error': 'Connection error: ${e.toString()}',
@@ -252,13 +260,8 @@ class ApiService {
         urlString += '?category_id=$categoryId';
       }
       final url = await _buildUriWithLanguage(urlString);
-      
       final headers = await getAuthHeaders();
-      
-      final response = await http.get(
-        url,
-        headers: headers,
-      );
+      final response = await http.get(url, headers: headers);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -273,18 +276,48 @@ class ApiService {
       final data = jsonDecode(response.body);
 
       if (response.statusCode == 200 && data['success'] == true) {
+        final menuList = List<Map<String, dynamic>>.from(data['data']);
+        if (categoryId == null) {
+          unawaited(OfflineSyncService.instance.saveCachedMenu(menuList));
+        }
         return {
           'success': true,
-          'data': data['data'],
-          'count': data['count'] ?? data['data'].length,
+          'data': menuList,
+          'count': data['count'] ?? menuList.length,
         };
       } else {
+        final cached = await OfflineSyncService.instance.getCachedMenu();
+        if (cached != null && cached.isNotEmpty) {
+          var list = cached;
+          if (categoryId != null) {
+            list = list.where((m) => (m['category_id'] as num?)?.toInt() == categoryId).toList();
+          }
+          return {
+            'success': true,
+            'data': list,
+            'count': list.length,
+            'is_offline': true,
+          };
+        }
         return {
           'success': false,
           'error': data['error'] ?? 'Failed to fetch menu items',
         };
       }
     } catch (e) {
+      final cached = await OfflineSyncService.instance.getCachedMenu();
+      if (cached != null && cached.isNotEmpty) {
+        var list = cached;
+        if (categoryId != null) {
+          list = list.where((m) => (m['category_id'] as num?)?.toInt() == categoryId).toList();
+        }
+        return {
+          'success': true,
+          'data': list,
+          'count': list.length,
+          'is_offline': true,
+        };
+      }
       return {
         'success': false,
         'error': 'Connection error: ${e.toString()}',
@@ -364,7 +397,6 @@ class ApiService {
   static Future<Map<String, dynamic>> getTables() async {
     try {
       final url = await _buildUriWithLanguage('${await baseUrl}/api/tables');
-
       final headers = await getAuthHeaders();
       final response = await http.get(url, headers: headers);
 
@@ -379,10 +411,17 @@ class ApiService {
 
       final data = jsonDecode(response.body);
       if (response.statusCode == 200 && data['success'] == true) {
+        final tablesList = List<Map<String, dynamic>>.from(data['data']);
+        unawaited(OfflineSyncService.instance.saveCachedTables(tablesList));
         return {
           'success': true,
-          'data': data['data'],
+          'data': tablesList,
         };
+      }
+
+      final cached = await OfflineSyncService.instance.getCachedTables();
+      if (cached != null && cached.isNotEmpty) {
+        return {'success': true, 'data': cached, 'is_offline': true};
       }
 
       return {
@@ -390,6 +429,10 @@ class ApiService {
         'error': data['error'] ?? 'Failed to fetch tables',
       };
     } catch (e) {
+      final cached = await OfflineSyncService.instance.getCachedTables();
+      if (cached != null && cached.isNotEmpty) {
+        return {'success': true, 'data': cached, 'is_offline': true};
+      }
       return {
         'success': false,
         'error': 'Connection error: ${e.toString()}',
@@ -401,7 +444,6 @@ class ApiService {
   static Future<Map<String, dynamic>> getWaiterOrders() async {
     try {
       final url = await _buildUriWithLanguage('${await baseUrl}/api/waiter/orders');
-
       final headers = await getAuthHeaders();
       final response = await http.get(url, headers: headers);
 
@@ -416,10 +458,33 @@ class ApiService {
 
       final data = jsonDecode(response.body);
       if (response.statusCode == 200 && data['success'] == true) {
+        final serverOrders = List<Map<String, dynamic>>.from(data['data']);
+
+        // Preserve any local offline pending orders that haven't synced yet
+        final localOrders = await OfflineSyncService.instance.getCachedOrders();
+        final List<Map<String, dynamic>> merged = [];
+        final Set<dynamic> serverOrderNos = serverOrders.map((o) => o['order_no']).toSet();
+
+        if (localOrders != null) {
+          for (final lo in localOrders) {
+            final id = (lo['order_id'] ?? lo['IDNo'] ?? lo['id'] as num?)?.toInt() ?? 0;
+            if (id < 0 && !serverOrderNos.contains(lo['order_no'])) {
+              merged.add(lo);
+            }
+          }
+        }
+        merged.addAll(serverOrders);
+
+        unawaited(OfflineSyncService.instance.saveCachedOrders(merged));
         return {
           'success': true,
-          'data': data['data'],
+          'data': merged,
         };
+      }
+
+      final cached = await OfflineSyncService.instance.getCachedOrders();
+      if (cached != null) {
+        return {'success': true, 'data': cached, 'is_offline': true};
       }
 
       return {
@@ -427,6 +492,10 @@ class ApiService {
         'error': data['error'] ?? 'Failed to fetch orders',
       };
     } catch (e) {
+      final cached = await OfflineSyncService.instance.getCachedOrders();
+      if (cached != null) {
+        return {'success': true, 'data': cached, 'is_offline': true};
+      }
       return {
         'success': false,
         'error': 'Connection error: ${e.toString()}',
@@ -474,6 +543,16 @@ class ApiService {
 
       final data = jsonDecode(response.body);
       if (response.statusCode == 200 && data['success'] == true) {
+        unawaited(OfflineSyncService.instance.updateLocalOrderStatus(
+          orderId: orderId,
+          status: status,
+          paymentMethod: paymentMethod,
+          discountAmount: discountAmount,
+          grandTotal: grandTotal,
+          amountPaid: amountPaid,
+          paymentRef: paymentRef,
+          remarks: remarks,
+        ));
         return {
           'success': true,
           'data': data['data'],
@@ -485,9 +564,34 @@ class ApiService {
         'error': data['error'] ?? 'Failed to update order status',
       };
     } catch (e) {
+      // Offline fallback: update local status & queue action
+      await OfflineSyncService.instance.updateLocalOrderStatus(
+        orderId: orderId,
+        status: status,
+        paymentMethod: paymentMethod,
+        discountAmount: discountAmount,
+        grandTotal: grandTotal,
+        amountPaid: amountPaid,
+        paymentRef: paymentRef,
+        remarks: remarks,
+      );
+      await OfflineSyncService.instance.enqueueAction(
+        type: 'update_status',
+        orderId: orderId,
+        payload: {
+          'status': status,
+          if (paymentMethod != null) 'payment_method': paymentMethod,
+          if (discountAmount != null) 'discount_amount': discountAmount,
+          if (grandTotal != null) 'grand_total': grandTotal,
+          if (amountPaid != null) 'amount_paid': amountPaid,
+          if (paymentRef != null) 'payment_ref': paymentRef,
+          if (remarks != null) 'remarks': remarks,
+        },
+      );
       return {
-        'success': false,
-        'error': 'Connection error: ${e.toString()}',
+        'success': true,
+        'data': {'order_id': orderId, 'status': status, 'is_offline': true},
+        'is_offline': true,
       };
     }
   }
@@ -520,6 +624,7 @@ class ApiService {
 
       final data = jsonDecode(response.body);
       if (response.statusCode == 200 && data['success'] == true) {
+        unawaited(OfflineSyncService.instance.transferLocalTableOrder(orderId, targetTableId));
         return {
           'success': true,
           'data': data['data'],
@@ -532,23 +637,33 @@ class ApiService {
         'error': data['error'] ?? 'Failed to transfer table order',
       };
     } catch (e) {
+      await OfflineSyncService.instance.transferLocalTableOrder(orderId, targetTableId);
+      await OfflineSyncService.instance.enqueueAction(
+        type: 'transfer_table',
+        orderId: orderId,
+        payload: {'target_table_id': targetTableId},
+      );
       return {
-        'success': false,
-        'error': 'Connection error: ${e.toString()}',
+        'success': true,
+        'data': {'order_id': orderId, 'new_table_id': targetTableId, 'is_offline': true},
+        'message': 'Table transfer saved locally (Offline)',
+        'is_offline': true,
       };
     }
   }
 
-  // Extend room charge — adds one more unit of the table's room charge to the
+  // Extend room charge — adds `qty` unit(s) (0.5 steps, same as admin's
+  // manual-order room charge stepper) of the table's room charge to the
   // order's service charge and recomputes the grand total.
   static Future<Map<String, dynamic>> extendRoomCharge({
     required int orderId,
+    double qty = 1.0,
   }) async {
     try {
       final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/extend-room-charge');
       final headers = await getAuthHeaders();
 
-      final response = await http.post(url, headers: headers);
+      final response = await http.post(url, headers: headers, body: jsonEncode({'qty': qty}));
 
       if (response.statusCode == 401) {
         await logout();
@@ -561,6 +676,7 @@ class ApiService {
 
       final data = jsonDecode(response.body);
       if (response.statusCode == 200 && data['success'] == true) {
+        unawaited(OfflineSyncService.instance.extendLocalRoomCharge(orderId, qty: qty));
         return {
           'success': true,
           'data': data['data'],
@@ -572,9 +688,16 @@ class ApiService {
         'error': data['error'] ?? 'Failed to extend room charge',
       };
     } catch (e) {
+      await OfflineSyncService.instance.extendLocalRoomCharge(orderId, qty: qty);
+      await OfflineSyncService.instance.enqueueAction(
+        type: 'extend_room_charge',
+        orderId: orderId,
+        payload: {'qty': qty},
+      );
       return {
-        'success': false,
-        'error': 'Connection error: ${e.toString()}',
+        'success': true,
+        'data': {'order_id': orderId, 'is_offline': true},
+        'is_offline': true,
       };
     }
   }
@@ -647,9 +770,61 @@ class ApiService {
         };
       }
     } catch (e) {
+      // Offline fallback: create local order with unique temp negative ID & enqueue
+      final tempId = OfflineSyncService.instance.generateTempOrderId();
+      final offlineOrderData = {
+        'order_id': tempId,
+        'order_no': orderNo,
+        'table_id': tableId,
+        'order_type': orderType,
+        'status': 3, // PENDING
+        'subtotal': subtotal,
+        'tax_amount': taxAmount,
+        'service_charge': serviceCharge,
+        'discount_amount': discountAmount,
+        'grand_total': grandTotal,
+        'encoded_dt': DateTime.now().toIso8601String(),
+        'is_offline': true,
+        'items': items.map((it) => {
+          'menu_id': it['menu_id'],
+          'qty': it['qty'],
+          'unit_price': it['unit_price'],
+          'line_total': ((it['qty'] as num?)?.toDouble() ?? 1.0) * ((it['unit_price'] as num?)?.toDouble() ?? 0.0),
+          'status': it['status'] ?? 3,
+          if (it['remarks'] != null) 'remarks': it['remarks'],
+        }).toList(),
+      };
+
+      await OfflineSyncService.instance.addLocalOfflineOrder(offlineOrderData);
+      await OfflineSyncService.instance.enqueueAction(
+        type: 'create_order',
+        orderId: tempId,
+        tempId: tempId,
+        payload: {
+          'order_no': orderNo,
+          if (tableId != null) 'table_id': tableId,
+          if (orderType != null) 'order_type': orderType,
+          'subtotal': subtotal,
+          'tax_amount': taxAmount,
+          'service_charge': serviceCharge,
+          'discount_amount': discountAmount,
+          'grand_total': grandTotal,
+          // Send the original offline timestamp so the server records the actual
+          // order time, not the later sync time.
+          'encoded_dt': DateTime.now().toIso8601String(),
+          'items': items,
+        },
+      );
+
       return {
-        'success': false,
-        'error': 'Connection error: ${e.toString()}',
+        'success': true,
+        'data': {
+          'order_id': tempId,
+          'order_no': orderNo,
+          'table_id': tableId,
+          'is_offline': true,
+        },
+        'is_offline': true,
       };
     }
   }
@@ -706,9 +881,16 @@ class ApiService {
         };
       }
     } catch (e) {
+      await OfflineSyncService.instance.addItemsToLocalOrder(orderId, items);
+      await OfflineSyncService.instance.enqueueAction(
+        type: 'add_items',
+        orderId: orderId,
+        payload: {'items': items},
+      );
       return {
-        'success': false,
-        'error': 'Connection error: ${e.toString()}',
+        'success': true,
+        'data': {'order_id': orderId, 'is_offline': true},
+        'is_offline': true,
       };
     }
   }

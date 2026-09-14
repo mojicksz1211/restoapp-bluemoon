@@ -259,6 +259,33 @@ extension _MenuHomeOrders on _MenuHomePageState {
         return;
       }
 
+      // Server says this table already has an open order (e.g. a waiter started
+      // one on another device, so our local `orders` list didn't know about it).
+      // Append to that order instead of failing the guest's order.
+      if (result['success'] != true &&
+          result['code'] == 'ACTIVE_ORDER_EXISTS' &&
+          result['existing_order_id'] != null) {
+        _setSubmittingOrder(false);
+        final existingOrderId = result['existing_order_id'] is int
+            ? result['existing_order_id'] as int
+            : int.tryParse(result['existing_order_id'].toString());
+        if (existingOrderId != null) {
+          await _addItemsToExistingOrder(
+            cartItems,
+            total,
+            orderType,
+            Order(
+              id: 'server-active-$existingOrderId',
+              items: const [],
+              totalPrice: 0,
+              orderTime: DateTime.now(),
+              orderId: existingOrderId,
+            ),
+          );
+        }
+        return;
+      }
+
       if (result['success'] == true) {
         final orderData = result['data'];
         final newOrderId = orderData['order_id'];

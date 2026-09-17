@@ -11,9 +11,14 @@ import '../shared/globals.dart';
 import '../waiterApp/pages/get_order_page.dart' as waiter_order;
 import 'widgets/bill_out_modal.dart';
 import '../waiterApp/widgets/transfer_table_modal.dart';
+import '../waiterApp/widgets/edit_order_bottom_sheet.dart';
+import '../waiterApp/widgets/menu_picker_sheet.dart';
 import '../shared/settings_sheet.dart';
 import '../shared/app_translations.dart';
+import '../shared/lan_broadcast_service.dart';
+import '../shared/background_service.dart';
 import '../shared/offline_sync_service.dart';
+import '../shared/widgets/offline_order_badge.dart';
 import '../shared/widgets/offline_sync_banner.dart';
 
 class SettlementData {
@@ -49,6 +54,10 @@ Widget _buildStatusChip(int status) {
     case 3:
       label = 'pending'.tr;
       color = const Color(0xFF0C0E2B);
+      break;
+    case -1:
+      label = 'cancelled'.tr;
+      color = Colors.red.shade700;
       break;
     default:
       label = 'unknown'.tr;
@@ -135,7 +144,7 @@ class CashierHomePage extends StatefulWidget {
   State<CashierHomePage> createState() => _CashierHomePageState();
 }
 
-class _CashierHomePageState extends State<CashierHomePage> {
+class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingObserver {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   bool _isLoading = true;
   String? _errorMessage;
@@ -143,6 +152,12 @@ class _CashierHomePageState extends State<CashierHomePage> {
   List<MenuItem> _menuItems = [];
   List<WaiterTable> _tables = [];
   String _floorFilter = 'all'; // 'all', 'gf', '2f'
+  // 'gf', '2f', or null (unscoped). Set per-account by an admin via the
+  // FLOOR column on user_info. Unlike waiterApp, this does NOT default to
+  // symmetric behavior — a branch typically wants its ground-floor cashier
+  // to settle everything (unscoped), and only a satellite floor cashier
+  // locked to just that floor's tables.
+  String? _floorScope;
   final Set<int> _joinedOrderIds = {};
   String _searchQuery = '';
   final TextEditingController _searchController = TextEditingController();
@@ -154,6 +169,8 @@ class _CashierHomePageState extends State<CashierHomePage> {
   VoidCallback? _disposeOrderUpdated;
   VoidCallback? _disposeOrderItemsAdded;
   VoidCallback? _disposeOrderCreated;
+  VoidCallback? _disposeLanOrderCreated;
+  VoidCallback? _disposeLanOrderItemsAdded;
 
   // Socket events arrive in bursts (the backend re-broadcasts every order on
   // connect and on any change). Coalesce the follow-up full refresh, guard
@@ -164,7 +181,30 @@ class _CashierHomePageState extends State<CashierHomePage> {
   bool _isLoadingData = false;
   bool _hasLoadedOrdersOnce = false;
   final Set<int> _alertedOrderIds = {};
+  // An offline order's id changes once it syncs (negative temp id -> real
+  // server id assigned by the backend), but its order_no (client-generated,
+  // e.g. ORD-20260915-...) stays the same across that transition. Tracking
+  // it too — alongside id — stops the order from being re-alerted as
+  // "newly appeared" under its new real id once internet returns and the
+  // REST refresh (_applyFreshOrders) or the real socket sees it again; the
+  // cashier already alerted on it via the LAN-broadcast fallback while it
+  // was still unsynced.
+  final Set<String> _alertedOrderNos = {};
+  // Last total item quantity this device already alerted on, per order — an
+  // `order_items_added` event has no natural one-shot dedup like
+  // `order_created` does (_alertedOrderIds), but the LAN-broadcast fallback
+  // re-sends the same unsynced add_items action's snapshot every ~10s while
+  // offline (see _rebroadcastPendingOrdersOverLan). Without this, each
+  // identical resend re-fired the alert popup/sound forever. Tracks summed
+  // quantity rather than items.length — adding more of a menu item ALREADY
+  // on the order merges into that item's existing qty server-side instead of
+  // appending a new line, so item count alone doesn't change even though
+  // something genuinely was added.
+  final Map<int, double> _lastAlertedItemsQty = {};
   static const int _maxAlertQueue = 15;
+
+  double _totalQuantity(WaiterOrder order) =>
+      order.items.fold<double>(0, (sum, item) => sum + item.quantity);
 
   void _updateRepeatingTtsAnnouncement() {
     if (_alertOrdersQueue.isEmpty) {
@@ -234,21 +274,73 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
   bool _isGroundFloorOrder(WaiterOrder order) {
     final numStr = (order.tableNumber ?? '').toUpperCase().trim();
-    if (numStr.contains('BAR') || numStr.contains('FAMILY')) return true;
-    final mMatch = RegExp(r'\bM\s*[-_]?\s*([0-9]+)\b').firstMatch(numStr);
-    if (mMatch != null) {
-      final mNum = int.tryParse(mMatch.group(1) ?? '');
-      if (mNum != null && mNum >= 1 && mNum <= 13) return true;
+    final roomMatch = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(numStr);
+    if (roomMatch != null) {
+      final roomNum = int.tryParse(roomMatch.group(1) ?? '');
+      if (roomNum != null && roomNum >= 1 && roomNum <= 13) return false;
     }
-    return false;
+    return true;
+  }
+
+  // Realtime order events (socket + REST-poll fallback) arrive branch-wide,
+  // not floor-scoped, so a floor-locked cashier account must filter them
+  // itself before alerting. Orders with no table (e.g. takeout) aren't tied
+  // to a floor, so they always stay visible — otherwise _isGroundFloorOrder's
+  // "no room match => ground floor" default would silently suppress a 2F
+  // cashier's own takeout-order alert.
+  bool _isOrderVisibleForFloorScope(WaiterOrder order) {
+    if (_floorScope != 'gf' && _floorScope != '2f') return true;
+    final tableNumber = order.tableNumber;
+    if (tableNumber == null || tableNumber.trim().isEmpty) return true;
+    final wantGf = _floorScope == 'gf';
+    return _isGroundFloorOrder(order) == wantGf;
+  }
+
+  // Same heuristic as _isGroundFloorOrder, applied to a WaiterTable instead
+  // of an order — needed to floor-scope `_tables` itself (used for settle/
+  // transfer lookups), separately from the order-list floor filter above.
+  bool _isGroundFloorTable(WaiterTable table) {
+    final numStr = table.number.toUpperCase().trim();
+    final roomMatch = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(numStr);
+    if (roomMatch != null) {
+      final roomNum = int.tryParse(roomMatch.group(1) ?? '');
+      if (roomNum != null && roomNum >= 1 && roomNum <= 13) return false;
+    }
+    return true;
+  }
+
+  List<WaiterTable> _applyFloorScope(List<WaiterTable> tables) {
+    if (_floorScope != 'gf' && _floorScope != '2f') return tables;
+    final wantGf = _floorScope == 'gf';
+    return tables.where((t) => _isGroundFloorTable(t) == wantGf).toList();
+  }
+
+  Future<void> _loadFloorScope() async {
+    final userData = await ApiService.getUserData();
+    if (!mounted) return;
+    setState(() {
+      _floorScope = userData['floor'];
+      if (_floorScope == 'gf' || _floorScope == '2f') {
+        _floorFilter = _floorScope!;
+      }
+    });
   }
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Tell the background service the UI is up front, before the first real
+    // lifecycle callback — otherwise a brand-new alert firing in the window
+    // between app launch and the first didChangeAppLifecycleState call would
+    // still show the banner even though the app is plainly already open.
+    BackgroundServiceManager.reportUiForeground(true);
     OfflineSyncService.instance.addDataSyncedListener(_onDataSynced);
-    _loadData();
+    // Floor scope must be known before the first table fetch resolves, so a
+    // floor-scoped account never briefly renders the other floor's tables.
+    _loadFloorScope().then((_) => _loadData()).then((_) => _checkPendingBackgroundAlerts());
     _initializeSocket();
+    BackgroundServiceManager.ensureStarted();
     languageNotifier.addListener(_onLanguageChanged);
     // Belt-and-suspenders: socket_io_client has NO real HTTP-polling fallback
     // on native platforms (io_transports.dart hardcodes WebSocketTransport
@@ -270,6 +362,35 @@ class _CashierHomePageState extends State<CashierHomePage> {
     }
   }
 
+  /// Requested flow: the background service's wake alert (ringtone, screen
+  /// on, full-screen notification) is only step one — once the app is
+  /// actually opened, it should ALSO show the normal in-app popup + TTS
+  /// announcement, same as if the order had arrived while the app was
+  /// already open. The background isolate and this UI isolate are separate
+  /// Dart isolates with no shared memory, so PendingForegroundAlerts (a tiny
+  /// SharedPreferences-backed handoff) is what lets this side know an alert
+  /// already fired in the background and still needs its foreground half.
+  /// Runs once, right after the first load — by then _orders has the fresh
+  /// data needed to build a real alert card instead of a stale/empty one.
+  Future<void> _checkPendingBackgroundAlerts() async {
+    final pendingIds = await PendingForegroundAlerts.takeAll();
+    if (pendingIds.isEmpty || !mounted) return;
+    final matches = _orders.where((o) => pendingIds.contains(o.id) && (o.status == 2 || o.status == 3)).toList();
+    if (matches.isEmpty) return;
+    setState(() {
+      for (final order in matches) {
+        // Side effect only (marks id/order_no as seen) — this alert always
+        // shows regardless of the boolean, but without this a later
+        // reconnect-backlog redelivery of the same order_created event
+        // would pass _shouldAlert's own check and fire a second time.
+        _shouldAlert(order);
+        _unacknowledgedOrderIds.add(order.id);
+        _enqueueAlert(order, addedItems: false);
+      }
+    });
+    _updateRepeatingTtsAnnouncement();
+  }
+
   void _onLanguageChanged() {
     if (mounted) {
       _loadData();
@@ -278,6 +399,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     OfflineSyncService.instance.removeDataSyncedListener(_onDataSynced);
     SoundService.stopRepeatingAlert();
     languageNotifier.removeListener(_onLanguageChanged);
@@ -286,6 +408,18 @@ class _CashierHomePageState extends State<CashierHomePage> {
     _cleanupSocket();
     _searchController.dispose();
     super.dispose();
+  }
+
+  // Tells the background service whether the UI is actually visible right
+  // now, so its wake-alert banner only fires when it's genuinely needed —
+  // app backgrounded/swiped away, or the screen turned off while the app was
+  // open. AppLifecycleState.resumed is the only state where the user could
+  // actually see the in-app popup, so every other state means "show the
+  // banner instead."
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    BackgroundServiceManager.reportUiForeground(state == AppLifecycleState.resumed);
   }
 
   Future<void> _loadData({bool showSpinner = true}) async {
@@ -328,7 +462,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
         }
 
         _applyFreshOrders(ordersData, extra: () {
-          _tables = loadedTables;
+          _tables = _applyFloorScope(loadedTables);
           _menuItems = loadedMenu;
           _isLoading = false;
         });
@@ -386,16 +520,45 @@ class _CashierHomePageState extends State<CashierHomePage> {
   /// fields (tables, menu, loading flag).
   void _applyFreshOrders(List<Map<String, dynamic>> ordersData, {VoidCallback? extra}) {
     final previousIds = _orders.map((o) => o.id).toSet();
+    // Total item quantity before this refresh, so an order we already knew
+    // about can still be detected as "items were added" below — previousIds
+    // alone only tells us the order itself isn't new. Quantity, not
+    // items.length: adding more of a menu item already on the order merges
+    // into that item's qty rather than appending a new line.
+    final previousItemQty = {for (final o in _orders) o.id: _totalQuantity(o)};
     final freshOrders = ordersData.map(WaiterOrder.fromApi).toList();
     // Skip on the very first load (everything is "new" then) and skip
     // settled orders (history, not something to alert about). Materialized
     // eagerly (not left as a lazy Iterable) since the predicate has a side
-    // effect (_alertedOrderIds.add) that must run exactly once per order.
+    // effect (_shouldAlert) that must run exactly once per order.
     final newlyAppeared = _hasLoadedOrdersOnce
         ? freshOrders
             .where((o) => !previousIds.contains(o.id) && (o.status == 2 || o.status == 3))
-            .where((o) => _alertedOrderIds.add(o.id))
+            .where(_isOrderVisibleForFloorScope)
+            .where((o) => _shouldAlert(o))
             .toList()
+        : const <WaiterOrder>[];
+
+    // The REST poll above only ever catches a missed `order_created` socket
+    // event (a brand-new order id). When the socket is down and a waiter
+    // adds items to an order the cashier ALREADY knows about, nothing here
+    // detected that — only the live `order_items_added` socket event did,
+    // and that never arrives either while the socket is disconnected. Catch
+    // it the same way: an order we already know about whose total quantity
+    // grew. Reuses _lastAlertedItemsQty (also used by the socket path) so a
+    // repeat poll of the same unacknowledged growth doesn't re-alert.
+    final itemsAddedOrders = _hasLoadedOrdersOnce
+        ? freshOrders.where((o) {
+            if (!previousIds.contains(o.id)) return false;
+            if (o.status != 2 && o.status != 3) return false;
+            if (!_isOrderVisibleForFloorScope(o)) return false;
+            final previousQty = previousItemQty[o.id];
+            final currentQty = _totalQuantity(o);
+            if (previousQty == null || currentQty <= previousQty) return false;
+            if (_lastAlertedItemsQty[o.id] == currentQty) return false;
+            _lastAlertedItemsQty[o.id] = currentQty;
+            return true;
+          }).toList()
         : const <WaiterOrder>[];
 
     setState(() {
@@ -411,10 +574,15 @@ class _CashierHomePageState extends State<CashierHomePage> {
         _unacknowledgedOrderIds.add(order.id);
         _enqueueAlert(order, addedItems: false);
       }
+      for (final order in itemsAddedOrders) {
+        debugPrint('✓ Poll: items added to order ${order.id} (socket missed it)');
+        _unacknowledgedOrderIds.add(order.id);
+        _enqueueAlert(order, addedItems: true);
+      }
       extra?.call();
     });
     _hasLoadedOrdersOnce = true;
-    if (newlyAppeared.isNotEmpty) {
+    if (newlyAppeared.isNotEmpty || itemsAddedOrders.isNotEmpty) {
       _updateRepeatingTtsAnnouncement();
     }
   }
@@ -469,6 +637,20 @@ class _CashierHomePageState extends State<CashierHomePage> {
       _disposeOrderCreated = SocketService.addOrderCreatedListener((data) {
         if (!mounted) return;
         _handleSocketOrderEvent(data, isFullUpdate: true, eventType: 'order_created');
+      });
+
+      // LAN fallback: same handler, just fed from a WiFi-local broadcast
+      // instead of the cloud socket — see lan_broadcast_service.dart.
+      _disposeLanOrderCreated?.call();
+      _disposeLanOrderCreated = LanBroadcastService.instance.addOrderCreatedListener((data) {
+        if (!mounted) return;
+        _handleSocketOrderEvent(data, isFullUpdate: true, eventType: 'order_created');
+      });
+
+      _disposeLanOrderItemsAdded?.call();
+      _disposeLanOrderItemsAdded = LanBroadcastService.instance.addOrderItemsAddedListener((data) {
+        if (!mounted) return;
+        _handleSocketOrderEvent(data, isFullUpdate: false, eventType: 'order_items_added');
       });
 
       _syncSocketOrderRooms();
@@ -531,7 +713,9 @@ class _CashierHomePageState extends State<CashierHomePage> {
       // unknown order from `order_updated` is the reconnect backlog or another
       // branch's traffic (the backend broadcasts globally), so it must not
       // alert. Alert each order at most once.
-      if (eventType == 'order_created' && _alertedOrderIds.add(updatedOrder.id)) {
+      if (eventType == 'order_created' &&
+          _isOrderVisibleForFloorScope(updatedOrder) &&
+          _shouldAlert(updatedOrder)) {
         setState(() {
           _unacknowledgedOrderIds.add(updatedOrder.id);
           _enqueueAlert(updatedOrder, addedItems: false);
@@ -539,11 +723,15 @@ class _CashierHomePageState extends State<CashierHomePage> {
         _updateRepeatingTtsAnnouncement();
       } else if (!isNewOrder &&
           (eventType == 'order_items_added' || data['items_added'] != null)) {
-        setState(() {
-          _unacknowledgedOrderIds.add(updatedOrder.id);
-          _enqueueAlert(updatedOrder, addedItems: true);
-        });
-        _updateRepeatingTtsAnnouncement();
+        final currentQty = _totalQuantity(updatedOrder);
+        if (_lastAlertedItemsQty[updatedOrder.id] != currentQty) {
+          _lastAlertedItemsQty[updatedOrder.id] = currentQty;
+          setState(() {
+            _unacknowledgedOrderIds.add(updatedOrder.id);
+            _enqueueAlert(updatedOrder, addedItems: true);
+          });
+          _updateRepeatingTtsAnnouncement();
+        }
       }
 
       // An unknown order from a plain `order_updated` / `order_items_added` is
@@ -600,6 +788,15 @@ class _CashierHomePageState extends State<CashierHomePage> {
       });
       _syncSocketOrderRooms();
 
+      // While offline, this device's own poll/refresh fallback re-reads its
+      // local cache and replaces `_orders` wholesale — an order that only
+      // ever lived in memory (arrived via LAN broadcast, never created
+      // here) would get wiped on the very next cycle and flicker in and
+      // out. Persist it locally so that fallback sees it too.
+      if (OfflineSyncService.instance.isOffline) {
+        unawaited(OfflineSyncService.instance.upsertCachedOrder(normalized));
+      }
+
       // Background refresh to guarantee DB sync for tables & totals — debounced
       // so a burst of socket events triggers at most one refetch.
       _scheduleSocketRefresh();
@@ -639,6 +836,19 @@ class _CashierHomePageState extends State<CashierHomePage> {
     if (_alertOrdersQueue.length > _maxAlertQueue) {
       _alertOrdersQueue.removeRange(0, _alertOrdersQueue.length - _maxAlertQueue);
     }
+  }
+
+  /// True the first time this order is seen, by either id or order_no —
+  /// and records both so it isn't alerted again. Checking order_no as well
+  /// as id is what stops an offline order from getting a second "new order"
+  /// alert once it syncs and reappears under its real server id (see
+  /// _alertedOrderNos above).
+  bool _shouldAlert(WaiterOrder order) {
+    final alreadyKnownById = !_alertedOrderIds.add(order.id);
+    final orderNo = order.orderNo;
+    final alreadyKnownByOrderNo =
+        orderNo != null && orderNo.isNotEmpty && !_alertedOrderNos.add(orderNo);
+    return !(alreadyKnownById || alreadyKnownByOrderNo);
   }
 
   String _getSpeechTableDescription(String? rawTable, String? orderType) {
@@ -683,6 +893,8 @@ class _CashierHomePageState extends State<CashierHomePage> {
     _disposeOrderUpdated?.call();
     _disposeOrderItemsAdded?.call();
     _disposeOrderCreated?.call();
+    _disposeLanOrderCreated?.call();
+    _disposeLanOrderItemsAdded?.call();
   }
 
   void _syncSocketOrderRooms() {
@@ -707,6 +919,27 @@ class _CashierHomePageState extends State<CashierHomePage> {
   }
 
   Future<void> _settleOrder(WaiterOrder order) async {
+    // A negative id means this order only exists as a local temp record —
+    // either this device created it offline and hasn't synced yet, or it
+    // arrived from another device via LAN broadcast and was never created
+    // here at all. Either way, settling it now would queue an update_status
+    // action against an id the server has never heard of, which can never
+    // resolve once back online (the temp->real id mapping is only ever
+    // learned by whichever device actually ran create_order). Block it
+    // until the order lands for real — it already shows the "Not synced"
+    // badge as the visible cue why.
+    if (order.id < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+          ),
+          backgroundColor: Color(0xFFD97706),
+        ),
+      );
+      return;
+    }
+
     final settlement = await showModalBottomSheet<SettlementData?>(
       context: context,
       isScrollControlled: true,
@@ -733,6 +966,13 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
       if (result['success'] == true) {
         await _loadData(showSpinner: false);
+        // _loadData no-ops (and leaves _isLoading untouched) if a background
+        // poll happens to already be in flight when this call fires — reset
+        // it explicitly rather than depending on that call actually having
+        // run, or this spinner can get stuck forever until the app restarts.
+        if (mounted) {
+          setState(() => _isLoading = false);
+        }
         if (mounted && _unacknowledgedOrderIds.isEmpty) {
           final isOffline = result['is_offline'] == true;
           ScaffoldMessenger.of(context).showSnackBar(
@@ -759,6 +999,236 @@ class _CashierHomePageState extends State<CashierHomePage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error: ${e.toString()}'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  Future<MenuItem?> _showMenuPicker(BuildContext context) async {
+    return showModalBottomSheet<MenuItem>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black54,
+      builder: (context) => MenuPickerSheet(menuItems: _menuItems),
+    );
+  }
+
+  Future<List<EditableOrderItem>?> _showEditOrderSheet(
+    WaiterOrder order,
+    List<EditableOrderItem> editableItems,
+  ) async {
+    return showModalBottomSheet<List<EditableOrderItem>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black54,
+      builder: (context) {
+        return EditOrderBottomSheet(
+          title: 'Edit Order',
+          subtitle: order.orderNo ?? 'Order #${order.id}',
+          menuItems: _menuItems,
+          initialItems: editableItems,
+          onPickMenuItem: _showMenuPicker,
+          onCancel: () {
+            Navigator.pop(context);
+          },
+          onSave: (_) {},
+        );
+      },
+    );
+  }
+
+  // Same online-only semantics as waiterApp's edit order (the underlying
+  // ApiService.replaceOrderItems has no offline queue support) — editing is
+  // a rarer, less time-critical action than creating/adding orders, so this
+  // intentionally doesn't get its own offline fallback.
+  Future<void> _editOrder(WaiterOrder order) async {
+    if (order.id < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+          ),
+          backgroundColor: Color(0xFFD97706),
+        ),
+      );
+      return;
+    }
+
+    if (_menuItems.isEmpty) {
+      final menuResult = await ApiService.getMenuItems();
+      if (menuResult['unauthorized'] == true) {
+        await _redirectToLogin();
+        return;
+      }
+      if (menuResult['success'] == true) {
+        final menuData = List<Map<String, dynamic>>.from(menuResult['data']);
+        setState(() {
+          _menuItems = menuData.map(MenuItem.fromApi).toList();
+        });
+      }
+    }
+
+    if (_menuItems.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No menu items available to edit this order.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    final editableItems = order.items
+        .where((item) => item.menuId != null)
+        .map((item) => EditableOrderItem(
+              menuId: item.menuId!,
+              name: item.name,
+              quantity: item.quantity,
+              unitPrice: item.unitPrice,
+              status: item.status,
+            ))
+        .toList();
+
+    if (editableItems.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No editable items found for this order.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    final updatedItems = await _showEditOrderSheet(order, editableItems);
+
+    if (updatedItems == null) return;
+    if (updatedItems.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Order must have at least one item.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (updatedItems.any((item) => item.menuId == null)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Please select a menu for all items.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    final payload = updatedItems.map((item) {
+      return {
+        'menu_id': item.menuId,
+        'qty': item.quantity,
+        'unit_price': item.unitPrice,
+        'status': item.status,
+      };
+    }).toList();
+
+    final result = await ApiService.replaceOrderItems(
+      orderId: order.id,
+      items: payload,
+    );
+
+    if (result['unauthorized'] == true) {
+      await _redirectToLogin();
+      return;
+    }
+
+    if (result['success'] == true) {
+      await _loadData(showSpinner: false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Order updated'), backgroundColor: Colors.green),
+        );
+      }
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result['error'] ?? 'Failed to update order'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  // Cancelling reuses the same status-update endpoint Settle already calls
+  // (status: -1 instead of 1) — the backend already fully handles it
+  // (frees the table, reverses inventory deductions), same as the existing
+  // cancel button in the admin web panel.
+  Future<void> _cancelOrder(WaiterOrder order) async {
+    if (order.id < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+          ),
+          backgroundColor: Color(0xFFD97706),
+        ),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Cancel order?'),
+        content: Text('Are you sure you want to cancel ${order.orderNo ?? 'order #${order.id}'}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('No'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Yes, cancel'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    final result = await ApiService.updateWaiterOrderStatus(
+      orderId: order.id,
+      status: -1,
+    );
+
+    if (result['unauthorized'] == true) {
+      await _redirectToLogin();
+      return;
+    }
+
+    if (result['success'] == true) {
+      await _loadData(showSpinner: false);
+      if (mounted) {
+        final isOffline = result['is_offline'] == true;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(isOffline ? 'Order cancelled locally (Offline). Will auto-sync when online.' : 'Order cancelled'),
+            backgroundColor: isOffline ? const Color(0xFFD97706) : Colors.red,
+          ),
+        );
+      }
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result['error'] ?? 'Failed to cancel order'), backgroundColor: Colors.red),
         );
       }
     }
@@ -847,7 +1317,17 @@ class _CashierHomePageState extends State<CashierHomePage> {
 
     final unsettledOrders = _orders.where((o) => o.status == 2 || o.status == 3).toList();
     final settledOrders = _orders.where((o) => o.status == 1).toList();
-    final totalCollected = settledOrders.fold(0.0, (sum, o) => sum + o.grandTotal);
+    // History tab shows settled AND cancelled orders together (so a
+    // cancelled order stays visible instead of vanishing) — kept separate
+    // from settledOrders/totalCollected so a cancelled order's total never
+    // counts toward collected revenue.
+    final historyOrders = _orders.where((o) => o.status == 1 || o.status == -1).toList();
+    // Header badges/pills must reflect the same floor scope as the list
+    // rendered below them — otherwise a floor-locked cashier sees e.g.
+    // "Unsettled: 12" while the cards underneath only show their own floor.
+    final scopedUnsettledCount = _filterByFloor(unsettledOrders).length;
+    final scopedHistoryCount = _filterByFloor(historyOrders).length;
+    final totalCollected = _filterByFloor(settledOrders).fold(0.0, (sum, o) => sum + o.grandTotal);
     final screenWidth = MediaQuery.of(context).size.width;
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape || screenWidth >= 800;
 
@@ -1003,7 +1483,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
                                     Text('unsettled'.tr),
-                                    if (unsettledOrders.isNotEmpty) ...[
+                                    if (scopedUnsettledCount > 0) ...[
                                       const SizedBox(width: 6),
                                       Container(
                                         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
@@ -1012,7 +1492,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
                                           borderRadius: BorderRadius.circular(10),
                                         ),
                                         child: Text(
-                                          '${unsettledOrders.length}',
+                                          '$scopedUnsettledCount',
                                           style: GoogleFonts.urbanist(
                                             color: Colors.white,
                                             fontSize: 10.5,
@@ -1029,7 +1509,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
                                     Text('history'.tr),
-                                    if (settledOrders.isNotEmpty) ...[
+                                    if (scopedHistoryCount > 0) ...[
                                       const SizedBox(width: 6),
                                       Container(
                                         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
@@ -1038,7 +1518,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
                                           borderRadius: BorderRadius.circular(10),
                                         ),
                                         child: Text(
-                                          '${settledOrders.length}',
+                                          '$scopedHistoryCount',
                                           style: GoogleFonts.urbanist(
                                             color: Colors.grey.shade700,
                                             fontSize: 10.5,
@@ -1060,7 +1540,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
                         // Stats pills
                         _buildLandscapeStatPill(
                           label: 'READY TO SETTLE',
-                          value: unsettledOrders.length.toString(),
+                          value: scopedUnsettledCount.toString(),
                           icon: Icons.assignment_turned_in_rounded,
                           color: const Color(0xFF0C0E2B),
                           bgColor: const Color(0xFF0C0E2B).withValues(alpha: 0.07),
@@ -1094,7 +1574,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
                           children: [
                             _buildQuickStat(
                               label: 'ready_to_settle'.tr,
-                              value: unsettledOrders.length.toString(),
+                              value: scopedUnsettledCount.toString(),
                               icon: Icons.assignment_turned_in_rounded,
                               color: const Color(0xFF0C0E2B),
                               isCompact: true,
@@ -1150,7 +1630,7 @@ class _CashierHomePageState extends State<CashierHomePage> {
                   physics: const AlwaysScrollableScrollPhysics(),
                   children: [
                     _buildOrderList(_filterAndSortOrders(unsettledOrders), isHistory: false),
-                    _buildOrderList(_filterOrders(settledOrders), isHistory: true),
+                    _buildOrderList(_filterOrders(historyOrders), isHistory: true),
                   ],
                 ),
               ),
@@ -1401,14 +1881,14 @@ class _CashierHomePageState extends State<CashierHomePage> {
     double padding = 20;
     double cardWidth = (screenWidth - (padding * 2) - (spacing * (crossAxisCount - 1))) / crossAxisCount;
 
-    final displayOrders = isHistory ? orders : _filterByFloor(orders);
+    final displayOrders = _filterByFloor(orders);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 100),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (!isHistory) ...[
+          if (!isHistory && _floorScope == null) ...[
             _buildFloorFilterChips(orders),
             const SizedBox(height: 16),
           ],
@@ -1449,7 +1929,10 @@ class _CashierHomePageState extends State<CashierHomePage> {
                     isHistory: isHistory,
                     tables: _tables,
                     menuItems: _menuItems,
+                    isGroundFloor: _isGroundFloorOrder(order),
                     onSettle: () => _settleOrder(order),
+                    onEdit: () => _editOrder(order),
+                    onCancel: () => _cancelOrder(order),
                     isPinned: _pinnedOrderIds.contains(order.id),
                     onPin: () => _togglePinOrder(order.id),
                     onRefresh: () => _loadData(showSpinner: false),
@@ -1590,6 +2073,8 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
     const primaryColor = Color(0xFF0C0E2B);
     const emeraldColor = Color(0xFF059669);
     final order = widget.order;
+    final isCancelled = order.status == -1;
+    final statusColor = isCancelled ? Colors.red.shade700 : emeraldColor;
     final isCash = (order.paymentMethod ?? 'CASH').toUpperCase() == 'CASH';
     final effectivePaid = order.amountPaid > 0 ? order.amountPaid : order.grandTotal;
     final changeAmount = (effectivePaid - order.grandTotal).clamp(0.0, double.infinity);
@@ -1660,26 +2145,28 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                             decoration: BoxDecoration(
-                              color: emeraldColor.withValues(alpha: 0.12),
+                              color: statusColor.withValues(alpha: 0.12),
                               borderRadius: BorderRadius.circular(6),
                             ),
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                const Icon(Icons.check_circle_rounded, size: 11, color: emeraldColor),
+                                Icon(isCancelled ? Icons.cancel_rounded : Icons.check_circle_rounded, size: 11, color: statusColor),
                                 const SizedBox(width: 4),
                                 Text(
-                                  'SETTLED',
+                                  isCancelled ? 'CANCELLED' : 'SETTLED',
                                   style: GoogleFonts.urbanist(
                                     fontSize: 9.5,
                                     fontWeight: FontWeight.w900,
-                                    color: emeraldColor,
+                                    color: statusColor,
                                     letterSpacing: 0.5,
                                   ),
                                 ),
                               ],
                             ),
                           ),
+                          const SizedBox(width: 6),
+                          OfflineOrderBadge(orderId: order.id),
                         ],
                       ),
                       const SizedBox(height: 3),
@@ -2919,6 +3406,9 @@ class _AnimatedOrderCard extends StatefulWidget {
   final WaiterOrder order;
   final bool isHistory;
   final VoidCallback onSettle;
+  final VoidCallback onEdit;
+  final VoidCallback onCancel;
+  final bool isGroundFloor;
   final bool isPinned;
   final VoidCallback onPin;
   final Future<void> Function() onRefresh;
@@ -2932,6 +3422,9 @@ class _AnimatedOrderCard extends StatefulWidget {
     required this.order,
     required this.isHistory,
     required this.onSettle,
+    required this.onEdit,
+    required this.onCancel,
+    required this.isGroundFloor,
     required this.isPinned,
     required this.onPin,
     required this.onRefresh,
@@ -2999,7 +3492,10 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
     final previewItems = items.take(3).toList();
     final remainingCount = items.length - previewItems.length;
 
-    return MouseRegion(
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        MouseRegion(
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
       child: AnimatedContainer(
@@ -3175,6 +3671,23 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                                 overflow: TextOverflow.ellipsis,
                               ),
                             ),
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                widget.isGroundFloor ? 'GF' : '2F',
+                                style: GoogleFonts.urbanist(
+                                  color: Colors.white70,
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 10,
+                                  letterSpacing: 0.3,
+                                ),
+                              ),
+                            ),
                             if (!widget.isHistory) ...[
                               const SizedBox(width: 6),
                               InkWell(
@@ -3193,7 +3706,15 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  _buildStatusChip(widget.order.status),
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      _buildStatusChip(widget.order.status),
+                      const SizedBox(height: 4),
+                      OfflineOrderBadge(orderId: widget.order.id),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -3554,6 +4075,30 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                           ),
                         ),
                         const SizedBox(width: 6),
+                        // Edit
+                        Expanded(
+                          flex: 1,
+                          child: SizedBox(
+                            height: 36,
+                            child: OutlinedButton.icon(
+                              onPressed: widget.onEdit,
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: primaryColor,
+                                side: BorderSide(color: Colors.grey.shade300),
+                                padding: EdgeInsets.zero,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                              ),
+                              icon: const Icon(Icons.edit_outlined, size: 14),
+                              label: Text(
+                                'Edit',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 12),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
                         // Settle
                         Expanded(
                           flex: 1,
@@ -3587,6 +4132,33 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
           ],
         ),
       ),
+        ),
+        // Circular X button floating at the top-right corner, matching
+        // waiterApp's table-card cancel button — only for active orders.
+        if (!widget.isHistory)
+          Positioned(
+            top: -8,
+            right: -8,
+            child: Material(
+              color: Colors.white,
+              shape: const CircleBorder(),
+              elevation: 3,
+              child: InkWell(
+                customBorder: const CircleBorder(),
+                onTap: widget.onCancel,
+                child: Container(
+                  width: 26,
+                  height: 26,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.red.shade200),
+                  ),
+                  child: Icon(Icons.close_rounded, size: 16, color: Colors.red.shade700),
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }

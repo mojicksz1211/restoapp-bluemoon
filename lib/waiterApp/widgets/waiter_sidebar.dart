@@ -28,6 +28,11 @@ class WaiterSidebar extends StatelessWidget {
   // Compact the header/logo/nav padding when the device is in landscape
   // orientation — vertical space is scarce on a tablet held sideways.
   final bool isLandscape;
+  // 'gf', '2f', or null (unscoped). When set, the sub-nav rows for the
+  // *other* floor are hidden — the account can only ever browse its own
+  // floor's tables, since `_tables` itself is already restricted server-side
+  // by the caller.
+  final String? lockedFloor;
 
   const WaiterSidebar({
     super.key,
@@ -41,6 +46,7 @@ class WaiterSidebar extends StatelessWidget {
     this.tableFilter = 'all',
     required this.onSelectTableFilter,
     this.isLandscape = false,
+    this.lockedFloor,
   });
 
   static const navy = Color(0xFF0C0E2B);
@@ -126,26 +132,30 @@ class WaiterSidebar extends StatelessWidget {
                         : 0,
               ),
               if (i == 0) ...[
-                _SubNavRow(
-                  label: 'GF Available',
-                  isSelected: selectedIndex == 0 && tableFilter == 'gf_available',
-                  onTap: () => onSelectTableFilter('gf_available'),
-                ),
-                _SubNavRow(
-                  label: 'GF Occupied',
-                  isSelected: selectedIndex == 0 && tableFilter == 'gf_occupied',
-                  onTap: () => onSelectTableFilter('gf_occupied'),
-                ),
-                _SubNavRow(
-                  label: '2F Available',
-                  isSelected: selectedIndex == 0 && tableFilter == '2f_available',
-                  onTap: () => onSelectTableFilter('2f_available'),
-                ),
-                _SubNavRow(
-                  label: '2F Occupied',
-                  isSelected: selectedIndex == 0 && tableFilter == '2f_occupied',
-                  onTap: () => onSelectTableFilter('2f_occupied'),
-                ),
+                if (lockedFloor != '2f') ...[
+                  _SubNavRow(
+                    label: 'GF Available',
+                    isSelected: selectedIndex == 0 && tableFilter == 'gf_available',
+                    onTap: () => onSelectTableFilter('gf_available'),
+                  ),
+                  _SubNavRow(
+                    label: 'GF Occupied',
+                    isSelected: selectedIndex == 0 && tableFilter == 'gf_occupied',
+                    onTap: () => onSelectTableFilter('gf_occupied'),
+                  ),
+                ],
+                if (lockedFloor != 'gf') ...[
+                  _SubNavRow(
+                    label: '2F Available',
+                    isSelected: selectedIndex == 0 && tableFilter == '2f_available',
+                    onTap: () => onSelectTableFilter('2f_available'),
+                  ),
+                  _SubNavRow(
+                    label: '2F Occupied',
+                    isSelected: selectedIndex == 0 && tableFilter == '2f_occupied',
+                    onTap: () => onSelectTableFilter('2f_occupied'),
+                  ),
+                ],
               ],
             ],
             const Spacer(),

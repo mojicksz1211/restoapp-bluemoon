@@ -11,6 +11,8 @@ import 'menuApp/services/api_service.dart';
 import 'shared/login_page.dart';
 import 'shared/globals.dart';
 import 'shared/offline_sync_service.dart';
+import 'shared/lan_broadcast_service.dart';
+import 'shared/background_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,6 +22,24 @@ void main() async {
     await OfflineSyncService.instance.initialize();
   } catch (e) {
     debugPrint('OfflineSyncService init error: $e');
+  }
+
+  // Best-effort LAN fallback for real-time order alerts when the cloud is
+  // unreachable but the tablets share WiFi — see lan_broadcast_service.dart.
+  try {
+    await LanBroadcastService.instance.initialize();
+  } catch (e) {
+    debugPrint('LanBroadcastService init error: $e');
+  }
+
+  // Register the background-service configuration early (per the plugin's
+  // own recommendation) — this doesn't start the service, just configures
+  // it; BackgroundServiceManager.ensureStarted() (called once a waiter/
+  // cashier home page mounts) is what actually starts it.
+  try {
+    await BackgroundServiceManager.initializeAndConfigure();
+  } catch (e) {
+    debugPrint('BackgroundServiceManager init error: $e');
   }
 
   // Enable fullscreen mode for Android (hide status bar and navigation bar)

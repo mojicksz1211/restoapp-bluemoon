@@ -3,7 +3,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import 'models.dart';
 import 'waiter_models.dart';
 import 'services/api_service.dart';
@@ -13,6 +12,7 @@ import '../shared/globals.dart';
 import '../shared/settings_sheet.dart';
 import 'widgets/confirm_order_bottom_sheet.dart';
 import 'widgets/edit_order_bottom_sheet.dart';
+import 'widgets/menu_picker_sheet.dart';
 import 'widgets/waiter_ui.dart';
 import 'widgets/waiter_sidebar.dart';
 import 'widgets/center_popup.dart';
@@ -22,6 +22,8 @@ import 'services/notification_service.dart';
 import 'pages/get_order_page.dart';
 import 'pages/tables_tab.dart';
 import 'pages/new_orders_tab.dart';
+import '../shared/lan_broadcast_service.dart';
+import '../shared/background_service.dart';
 import '../shared/offline_sync_service.dart';
 import '../shared/widgets/offline_sync_banner.dart';
 
@@ -41,6 +43,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   List<MenuItem> _menuItems = [];
   int? _branchId;
   String? _currentUserId;
+  // 'gf', '2f', or null (unscoped — sees both floors). Set per-account by an
+  // admin via the FLOOR column on user_info; restricts this account to only
+  // its own floor's tables/orders.
+  String? _floorScope;
   final Set<int> _joinedOrderIds = {};
   // REST fallback poll — socket_io_client has no real HTTP-polling fallback
   // on native, so on WebSocket-blocked networks the socket never connects and
@@ -54,6 +60,8 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   VoidCallback? _disposeOrderItemsAdded;
   VoidCallback? _disposeOrderCreated;
   VoidCallback? _disposeTableUpdated;
+  VoidCallback? _disposeLanOrderCreated;
+  VoidCallback? _disposeLanOrderItemsAdded;
   // Cached from DefaultTabController.of(...) in build() — the "View Order"
   // action on the New Order Received popup needs to switch tabs from a
   // socket callback, outside build()'s scope where the controller normally
@@ -68,9 +76,11 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     super.initState();
     WaiterCartStore.instance.restore();
     OfflineSyncService.instance.addDataSyncedListener(_onDataSynced);
-    _loadBranchId();
-    _loadData();
+    // Floor scope must be known before the first table fetch resolves, so a
+    // floor-scoped account never briefly renders the other floor's tables.
+    _loadBranchId().then((_) => _loadData());
     _initializeSocket();
+    BackgroundServiceManager.ensureStarted();
     _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (mounted && !SocketService.isConnected) _pollData();
     });
@@ -92,7 +102,58 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     setState(() {
       _branchId = branchId;
       _currentUserId = userData['user_id'];
+      _floorScope = userData['floor'];
     });
+  }
+
+  // Same table-naming heuristic used across waiterApp/cashierApp: tables
+  // named "Room 1" through "Room 13" are 2nd Floor; every other table is
+  // Ground Floor. There's no floor column on restaurant_tables — this name
+  // convention is the single source of truth for "which floor is this on."
+  bool _isGroundFloorNumber(String numStr) {
+    final normalized = numStr.toUpperCase().trim();
+    final roomMatch = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(normalized);
+    if (roomMatch != null) {
+      final roomNum = int.tryParse(roomMatch.group(1) ?? '');
+      if (roomNum != null && roomNum >= 1 && roomNum <= 13) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool _isGroundFloorTable(WaiterTable table) => _isGroundFloorNumber(table.number);
+
+  // Single choke point for floor-scoping: every `_tables` assignment routes
+  // through this so table counts, the Tables tab grid, the transfer modal
+  // and the new-order table picker are all automatically restricted for a
+  // floor-scoped account, with no per-consumer filtering needed.
+  List<WaiterTable> _applyFloorScope(List<WaiterTable> tables) {
+    if (_floorScope != 'gf' && _floorScope != '2f') return tables;
+    final wantGf = _floorScope == 'gf';
+    return tables.where((t) => _isGroundFloorTable(t) == wantGf).toList();
+  }
+
+  // Orders don't carry a floor field (same as tables — inferred from the
+  // table-name convention above). Orders with no table (e.g. takeout) aren't
+  // tied to a floor, so they always stay visible regardless of scope —
+  // otherwise a floor-scoped waiter's own takeout order would vanish from
+  // their own New Orders tab.
+  bool _isOrderVisibleForFloorScope(WaiterOrder order) {
+    if (_floorScope != 'gf' && _floorScope != '2f') return true;
+    final tableNumber = order.tableNumber;
+    if (tableNumber == null || tableNumber.trim().isEmpty) return true;
+    final wantGf = _floorScope == 'gf';
+    return _isGroundFloorNumber(tableNumber) == wantGf;
+  }
+
+  // Mirrors _applyFloorScope but for orders — used at the New Orders/Order
+  // List derivation point and before firing the new-order alert, so a
+  // floor-scoped waiter never sees or gets alerted about the other floor's
+  // orders even though the underlying socket room is branch-wide, not
+  // floor-scoped.
+  List<WaiterOrder> _applyOrderFloorScope(List<WaiterOrder> orders) {
+    return orders.where(_isOrderVisibleForFloorScope).toList();
   }
 
   @override
@@ -122,9 +183,9 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       if (!mounted) return;
       if (tablesResult['success'] == true && ordersResult['success'] == true) {
         setState(() {
-          _tables = List<Map<String, dynamic>>.from(tablesResult['data'])
+          _tables = _applyFloorScope(List<Map<String, dynamic>>.from(tablesResult['data'])
               .map(WaiterTable.fromApi)
-              .toList();
+              .toList());
           _orders = List<Map<String, dynamic>>.from(ordersResult['data'])
               .map(WaiterOrder.fromApi)
               .toList();
@@ -205,7 +266,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
         );
 
         setState(() {
-          _tables = tablesData.map(WaiterTable.fromApi).toList();
+          _tables = _applyFloorScope(tablesData.map(WaiterTable.fromApi).toList());
           _orders = ordersData.map(WaiterOrder.fromApi).toList();
           _menuItems = menuData.map(MenuItem.fromApi).toList();
           _isLoading = false;
@@ -346,13 +407,28 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
         _handleSocketTableEvent(data);
       });
 
+      // LAN fallback: same handler, just fed from a WiFi-local broadcast
+      // instead of the cloud socket — see lan_broadcast_service.dart. Alerts
+      // stay cashierApp-only even for this offline path, so allowAlert:false.
+      _disposeLanOrderCreated?.call();
+      _disposeLanOrderCreated = LanBroadcastService.instance.addOrderCreatedListener((data) {
+        if (!mounted) return;
+        _handleSocketOrderEvent(data, allowAlert: false);
+      });
+
+      _disposeLanOrderItemsAdded?.call();
+      _disposeLanOrderItemsAdded = LanBroadcastService.instance.addOrderItemsAddedListener((data) {
+        if (!mounted) return;
+        _handleSocketOrderEvent(data, allowAlert: false);
+      });
+
       _syncSocketOrderRooms();
     } catch (e) {
       debugPrint('Error initializing socket in waiter_home_page: $e');
     }
   }
 
-  void _handleSocketOrderEvent(Map<String, dynamic> data) {
+  void _handleSocketOrderEvent(Map<String, dynamic> data, {bool allowAlert = true}) {
     // Ignore other branches' realtime traffic (defensive — the backend already
     // emits to per-branch rooms).
     final rawOrderData = data['order'];
@@ -415,8 +491,23 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       });
       _syncSocketOrderRooms();
 
-      // Show alert for new pending orders placed by someone else
-      if (isNewPendingOrder && !isOwnOrder && mounted) {
+      // While offline, this device's own poll fallback re-reads its local
+      // cache and replaces `_orders` wholesale — an order that only ever
+      // lived in memory (arrived via LAN broadcast, never created here)
+      // would get wiped on the very next poll tick and flicker in and out.
+      // Persist it locally so that fallback sees it too.
+      if (OfflineSyncService.instance.isOffline) {
+        unawaited(OfflineSyncService.instance.upsertCachedOrder(normalized));
+      }
+
+      // Show alert for new pending orders placed by someone else. Only for
+      // the real (online) socket path — allowAlert:false for the LAN
+      // fallback keeps offline-mode notifications cashierApp-only.
+      if (allowAlert &&
+          isNewPendingOrder &&
+          !isOwnOrder &&
+          mounted &&
+          _isOrderVisibleForFloorScope(updatedOrder)) {
         _showNewOrderAlert(updatedOrder);
       }
     } catch (e) {
@@ -459,10 +550,14 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       _disposeOrderItemsAdded?.call();
       _disposeOrderCreated?.call();
       _disposeTableUpdated?.call();
+      _disposeLanOrderCreated?.call();
+      _disposeLanOrderItemsAdded?.call();
       _disposeOrderUpdated = null;
       _disposeOrderItemsAdded = null;
       _disposeOrderCreated = null;
       _disposeTableUpdated = null;
+      _disposeLanOrderCreated = null;
+      _disposeLanOrderItemsAdded = null;
     } catch (e) {
       debugPrint('Error cleaning up socket in waiter_home_page: $e');
     }
@@ -547,7 +642,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     try {
       if (action == 'deleted') {
         setState(() {
-          _tables = _tables.where((t) => t.id != tableId).toList();
+          _tables = _applyFloorScope(_tables.where((t) => t.id != tableId).toList());
         });
         return;
       }
@@ -556,12 +651,12 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       setState(() {
         final existingIndex = _tables.indexWhere((t) => t.id == tableId);
         if (existingIndex == -1) {
-          _tables = [..._tables, updatedTable];
+          _tables = _applyFloorScope([..._tables, updatedTable]);
           return;
         }
         final nextTables = List<WaiterTable>.from(_tables);
         nextTables[existingIndex] = updatedTable;
-        _tables = nextTables;
+        _tables = _applyFloorScope(nextTables);
       });
     } catch (e) {
       debugPrint('Error updating table from socket in waiter_home_page: $e');
@@ -714,6 +809,73 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
           backgroundColor: Colors.red,
         ),
       );
+    }
+  }
+
+  // Cancelling reuses the same status-update endpoint used to settle/confirm
+  // orders (status: -1 instead of 1/2) — the backend already fully handles
+  // it (frees the table, reverses inventory deductions), same as the
+  // existing cancel button in the admin web panel and cashierApp.
+  Future<void> _cancelOrder(WaiterOrder order) async {
+    if (order.id < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+          ),
+          backgroundColor: Color(0xFFD97706),
+        ),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Cancel order?'),
+        content: Text('Are you sure you want to cancel ${order.orderNo ?? 'order #${order.id}'}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('No'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Yes, cancel'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    final result = await ApiService.updateWaiterOrderStatus(
+      orderId: order.id,
+      status: -1,
+    );
+
+    if (result['unauthorized'] == true) {
+      await _redirectToLogin();
+      return;
+    }
+
+    if (result['success'] == true) {
+      await _loadData(showSpinner: false);
+      if (mounted) {
+        final isOffline = result['is_offline'] == true;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(isOffline ? 'Order cancelled locally (Offline). Will auto-sync when online.' : 'Order cancelled'),
+            backgroundColor: isOffline ? const Color(0xFFD97706) : Colors.red,
+          ),
+        );
+      }
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result['error'] ?? 'Failed to cancel order'), backgroundColor: Colors.red),
+        );
+      }
     }
   }
 
@@ -1678,6 +1840,41 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                     ),
                   ),
                 ),
+              // Independent of the status==2 block above (Transfer/Edit/Add
+              // Items) so adding Cancel here can't disturb any of that —
+              // covers both pending (3) and confirmed (2) orders, matching
+              // cashierApp's cancel availability.
+              if (order.status == 2 || order.status == 3)
+                Container(
+                  padding: EdgeInsets.fromLTRB(16, order.status == 2 ? 0 : 12, 16, isMobile ? 16 : 20),
+                  decoration: const BoxDecoration(color: Color(0xFFF5F6F0)),
+                  child: SafeArea(
+                    top: false,
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _cancelOrder(order);
+                        },
+                        icon: Icon(Icons.close_rounded, size: 20, color: Colors.red.shade700),
+                        label: Text(
+                          'Cancel Order',
+                          style: GoogleFonts.urbanist(
+                            fontWeight: FontWeight.bold,
+                            fontSize: isMobile ? 14.5 : 16,
+                            color: Colors.red.shade700,
+                          ),
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          padding: EdgeInsets.symmetric(vertical: isMobile ? 12 : 14),
+                          side: BorderSide(color: Colors.red.shade300, width: 1.5),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
             ],
           ),
         );
@@ -1691,7 +1888,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black54,
-      builder: (context) => _MenuPickerSheet(menuItems: _menuItems),
+      builder: (context) => MenuPickerSheet(menuItems: _menuItems),
     );
   }
 
@@ -1812,13 +2009,14 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       );
     }
 
-    final newOrders = _orders.where((order) => order.status == 3).toList();
-    final confirmedOrders = _orders.where((order) => order.status == 2 || order.status == 1).toList();
+    final scopedOrders = _applyOrderFloorScope(_orders);
+    final newOrders = scopedOrders.where((order) => order.status == 3).toList();
+    final confirmedOrders = scopedOrders.where((order) => order.status == 2 || order.status == 1 || order.status == -1).toList();
     // Badge counts: New Orders = pending orders awaiting review; Order List =
     // confirmed-but-not-yet-settled orders, i.e. the ones still active on the
     // floor. Settled (status 1) orders are just history, not "unread" items.
     final newOrdersCount = newOrders.length;
-    final activeOrderCount = _orders.where((order) => order.status == 2).length;
+    final activeOrderCount = scopedOrders.where((order) => order.status == 2).length;
 
     return DefaultTabController(
       length: 3,
@@ -1844,40 +2042,25 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
             }
           }
 
-          bool isGroundFloorTable(WaiterTable table) {
-            final numStr = table.number.toUpperCase().trim();
-            if (numStr.contains('BAR') || numStr.contains('FAMILY')) {
-              return true;
-            }
-            final mMatch = RegExp(r'\bM\s*[-_]?\s*([0-9]+)\b').firstMatch(numStr);
-            if (mMatch != null) {
-              final mNum = int.tryParse(mMatch.group(1) ?? '');
-              if (mNum != null && mNum >= 1 && mNum <= 13) {
-                return true;
-              }
-            }
-            return false;
-          }
-
           final allTablesCount = _tables.length;
-          final gfAvailableCount = _tables.where((t) => isGroundFloorTable(t) && t.status == 1).length;
-          final gfOccupiedCount = _tables.where((t) => isGroundFloorTable(t) && t.status != 1).length;
-          final secondFloorAvailableCount = _tables.where((t) => !isGroundFloorTable(t) && t.status == 1).length;
-          final secondFloorOccupiedCount = _tables.where((t) => !isGroundFloorTable(t) && t.status != 1).length;
+          final gfAvailableCount = _tables.where((t) => _isGroundFloorTable(t) && t.status == 1).length;
+          final gfOccupiedCount = _tables.where((t) => _isGroundFloorTable(t) && t.status != 1).length;
+          final secondFloorAvailableCount = _tables.where((t) => !_isGroundFloorTable(t) && t.status == 1).length;
+          final secondFloorOccupiedCount = _tables.where((t) => !_isGroundFloorTable(t) && t.status != 1).length;
 
           // Filter tables based on selected tab / sidebar option
           final filteredTables = _tableFilter == 'gf_available'
-              ? _tables.where((t) => isGroundFloorTable(t) && t.status == 1).toList()
+              ? _tables.where((t) => _isGroundFloorTable(t) && t.status == 1).toList()
               : _tableFilter == 'gf_occupied'
-                  ? _tables.where((t) => isGroundFloorTable(t) && t.status != 1).toList()
+                  ? _tables.where((t) => _isGroundFloorTable(t) && t.status != 1).toList()
                   : _tableFilter == '2f_available'
-                      ? _tables.where((t) => !isGroundFloorTable(t) && t.status == 1).toList()
+                      ? _tables.where((t) => !_isGroundFloorTable(t) && t.status == 1).toList()
                       : _tableFilter == '2f_occupied'
-                          ? _tables.where((t) => !isGroundFloorTable(t) && t.status != 1).toList()
+                          ? _tables.where((t) => !_isGroundFloorTable(t) && t.status != 1).toList()
                           : _tableFilter == 'ground_floor'
-                              ? _tables.where(isGroundFloorTable).toList()
+                              ? _tables.where(_isGroundFloorTable).toList()
                               : _tableFilter == '2nd_floor'
-                                  ? _tables.where((t) => !isGroundFloorTable(t)).toList()
+                                  ? _tables.where((t) => !_isGroundFloorTable(t)).toList()
                                   : _tableFilter == 'occupied'
                                       ? _tables.where((t) => t.status != 1).toList()
                                       : _tableFilter == 'available'
@@ -1947,6 +2130,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                         total2fAvailableCount: secondFloorAvailableCount,
                         total2fOccupiedCount: secondFloorOccupiedCount,
                         showFilterChips: isMobile,
+                        lockedFloor: _floorScope,
                         onViewDetails: (table) {
                           _showTableOrderDetails(table);
                         },
@@ -1965,6 +2149,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                         onAddOrder: _addOrderForTable,
                         onEditOrder: _editOrderForTable,
                         onExtendRoomCharge: _extendRoomChargeForTable,
+                        onCancelOrder: _cancelOrder,
                       ),
                       NewOrdersTab(
                         orders: newOrders,
@@ -2077,6 +2262,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                                   setState(() => _tableFilter = filter);
                                   controller.animateTo(0);
                                 },
+                                lockedFloor: _floorScope,
                                 width: isMobile
                                     ? 200
                                     : (mediaQuery.size.width < 750
@@ -2118,295 +2304,6 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     }
   }
 
-}
-
-/// Menu picker for the "Add item" row inside Edit Order — was a dense,
-/// unsearchable grid of tiny name/price boxes. Redesigned as a searchable
-/// list (filter by name or category) with a bigger, easier-to-scan row —
-/// icon badge, bold name, category subtitle, price.
-class _MenuPickerSheet extends StatefulWidget {
-  final List<MenuItem> menuItems;
-
-  const _MenuPickerSheet({required this.menuItems});
-
-  @override
-  State<_MenuPickerSheet> createState() => _MenuPickerSheetState();
-}
-
-class _MenuPickerSheetState extends State<_MenuPickerSheet> {
-  static const int _pageSize = 15;
-
-  final TextEditingController _searchController = TextEditingController();
-  String _query = '';
-  int _page = 0;
-
-  @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    const navy = Color(0xFF0C0E2B);
-    const navyLight = Color(0xFF1B1E4A);
-    const gold = Color(0xFFE8C468);
-
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isMobile = screenWidth < 600;
-    final query = _query.trim().toLowerCase();
-    final items = query.isEmpty
-        ? widget.menuItems
-        : widget.menuItems
-            .where((m) => m.name.toLowerCase().contains(query) || m.category.toLowerCase().contains(query))
-            .toList();
-
-    final maxPage = items.isEmpty ? 0 : (items.length - 1) ~/ _pageSize;
-    final page = _page > maxPage ? maxPage : _page;
-    final start = page * _pageSize;
-    final end = (start + _pageSize).clamp(0, items.length);
-    final pageItems = items.isEmpty ? const <MenuItem>[] : items.sublist(start, end);
-
-    return DraggableScrollableSheet(
-      initialChildSize: isMobile ? 0.8 : 0.7,
-      minChildSize: isMobile ? 0.5 : 0.4,
-      maxChildSize: 0.92,
-      expand: false,
-      builder: (context, scrollController) {
-        return Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFFF5F6F0),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          child: Column(
-            children: [
-              Container(
-                padding: EdgeInsets.fromLTRB(isMobile ? 16 : 20, isMobile ? 16 : 20, isMobile ? 16 : 20, 14),
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(colors: [navy, navyLight]),
-                  borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'Select Menu Item',
-                          style: GoogleFonts.urbanist(
-                            fontSize: isMobile ? 18 : 20,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white,
-                          ),
-                        ),
-                        InkWell(
-                          onTap: () => Navigator.pop(context),
-                          borderRadius: BorderRadius.circular(20),
-                          child: const Padding(
-                            padding: EdgeInsets.all(4),
-                            child: Icon(Icons.close, color: Colors.white),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _searchController,
-                      onChanged: (value) => setState(() {
-                        _query = value;
-                        _page = 0;
-                      }),
-                      style: GoogleFonts.urbanist(color: Colors.white, fontSize: 14.5),
-                      cursorColor: gold,
-                      decoration: InputDecoration(
-                        isDense: true,
-                        filled: true,
-                        fillColor: Colors.white.withValues(alpha: 0.08),
-                        hintText: 'Search menu item or category',
-                        hintStyle: GoogleFonts.urbanist(color: Colors.white.withValues(alpha: 0.45), fontSize: 13.5),
-                        prefixIcon: Icon(Icons.search, size: 20, color: Colors.white.withValues(alpha: 0.55)),
-                        suffixIcon: _query.isEmpty
-                            ? null
-                            : IconButton(
-                                icon: Icon(Icons.close, size: 18, color: Colors.white.withValues(alpha: 0.55)),
-                                onPressed: () {
-                                  _searchController.clear();
-                                  setState(() {
-                                    _query = '';
-                                    _page = 0;
-                                  });
-                                },
-                                splashRadius: 16,
-                              ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.18)),
-                        ),
-                        enabledBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.18)),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          borderSide: const BorderSide(color: gold, width: 1.5),
-                        ),
-                        contentPadding: const EdgeInsets.symmetric(vertical: 12),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: items.isEmpty
-                    ? Center(
-                        child: Text(
-                          'No items found',
-                          style: GoogleFonts.urbanist(color: Colors.grey[600]),
-                        ),
-                      )
-                    : ListView.separated(
-                        controller: scrollController,
-                        padding: EdgeInsets.fromLTRB(16, 12, 16, isMobile ? 16 : 20),
-                        itemCount: pageItems.length,
-                        separatorBuilder: (context, index) => const SizedBox(height: 8),
-                        itemBuilder: (context, index) {
-                          final menuItem = pageItems[index];
-                          return Material(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(14),
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(14),
-                              onTap: () => Navigator.pop(context, menuItem),
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                                child: Row(
-                                  children: [
-                                    ClipRRect(
-                                      borderRadius: BorderRadius.circular(10),
-                                      child: SizedBox(
-                                        width: 42,
-                                        height: 42,
-                                        child: menuItem.imageUrl != null && menuItem.imageUrl!.startsWith('http')
-                                            ? CachedNetworkImage(
-                                                imageUrl: menuItem.imageUrl!,
-                                                cacheKey: '${menuItem.imageUrl}_menupicker',
-                                                fit: BoxFit.cover,
-                                                memCacheWidth: 84,
-                                                memCacheHeight: 84,
-                                                fadeInDuration: const Duration(milliseconds: 150),
-                                                placeholder: (context, url) => Container(
-                                                  color: gold.withValues(alpha: 0.14),
-                                                  child: Icon(menuItem.icon, size: 20, color: gold),
-                                                ),
-                                                errorWidget: (context, url, error) => Container(
-                                                  color: gold.withValues(alpha: 0.14),
-                                                  child: Icon(menuItem.icon, size: 20, color: gold),
-                                                ),
-                                              )
-                                            : Container(
-                                                color: gold.withValues(alpha: 0.14),
-                                                child: Icon(menuItem.icon, size: 20, color: gold),
-                                              ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 12),
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        children: [
-                                          Text(
-                                            menuItem.name,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: GoogleFonts.urbanist(
-                                              fontWeight: FontWeight.w700,
-                                              fontSize: 14.5,
-                                              color: navy,
-                                            ),
-                                          ),
-                                          const SizedBox(height: 2),
-                                          Text(
-                                            menuItem.category,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: GoogleFonts.urbanist(fontSize: 12, color: Colors.grey[600]),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Text(
-                                      '₱${formatPrice(menuItem.price)}',
-                                      style: GoogleFonts.urbanist(fontWeight: FontWeight.bold, fontSize: 14, color: navy),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-              ),
-              if (items.length > _pageSize)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    border: Border(top: BorderSide(color: gold.withValues(alpha: 0.25))),
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      _MenuPickerPageButton(
-                        icon: Icons.chevron_left,
-                        onTap: page > 0 ? () => setState(() => _page = page - 1) : null,
-                      ),
-                      const SizedBox(width: 16),
-                      Text(
-                        'Page ${page + 1} of ${maxPage + 1}',
-                        style: GoogleFonts.urbanist(fontWeight: FontWeight.w600, fontSize: 13.5, color: navy),
-                      ),
-                      const SizedBox(width: 16),
-                      _MenuPickerPageButton(
-                        icon: Icons.chevron_right,
-                        onTap: page < maxPage ? () => setState(() => _page = page + 1) : null,
-                      ),
-                    ],
-                  ),
-                ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-class _MenuPickerPageButton extends StatelessWidget {
-  final IconData icon;
-  final VoidCallback? onTap;
-
-  const _MenuPickerPageButton({required this.icon, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    const navy = Color(0xFF0C0E2B);
-    const gold = Color(0xFFE8C468);
-    final enabled = onTap != null;
-    return Material(
-      color: enabled ? navy : Colors.grey.shade200,
-      shape: const CircleBorder(),
-      child: InkWell(
-        onTap: onTap,
-        customBorder: const CircleBorder(),
-        child: Padding(
-          padding: const EdgeInsets.all(6),
-          child: Icon(icon, size: 20, color: enabled ? gold : Colors.grey.shade400),
-        ),
-      ),
-    );
-  }
 }
 
 /// One line of the order-details totals breakdown (Subtotal / Service

@@ -1,12 +1,25 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:bluemoon_resto_app/shared/offline_db.dart';
 import 'package:bluemoon_resto_app/shared/offline_sync_service.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  setUpAll(() {
+    // sqflite has no platform channel in a plain `flutter test` run — swap
+    // in the FFI (pure-Dart sqlite3) factory so OfflineDb can actually open.
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  });
+
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    // In-memory + a fresh handle each test, so no state leaks between tests
+    // or across separate `flutter test` runs.
+    OfflineDb.testOverridePath = inMemoryDatabasePath;
+    await OfflineDb.instance.resetForTest();
   });
 
   group('OfflineSyncService Tests', () {

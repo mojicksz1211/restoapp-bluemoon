@@ -9,7 +9,12 @@ import 'socket_service.dart';
 class ApiService {
   // Cached base URL to avoid repeated async calls
   static String? _cachedBaseUrl;
-  
+  // WiFi-connected-but-no-internet is the worst case for a bare http call —
+  // the OS's own TCP connect timeout can run 60s+ before a SocketException
+  // is even thrown, which feels like the app is frozen. Every request below
+  // caps at this instead, so the existing offline fallbacks kick in fast.
+  static const Duration _httpTimeout = Duration(seconds: 8);
+
   // Get base URL from config
   static Future<String> get baseUrl async {
     if (_cachedBaseUrl == null) {
@@ -62,7 +67,7 @@ class ApiService {
           'username': username,
           'password': password,
         }),
-      );
+      ).timeout(_httpTimeout);
 
       final data = jsonDecode(response.body);
 
@@ -88,6 +93,13 @@ class ApiService {
         }
         if (data['data']['branch_name'] != null) {
           await prefs.setString('branch_name', data['data']['branch_name'].toString());
+        }
+        // Floor scope — restricts waiter/cashier accounts to Ground Floor or
+        // 2nd Floor tables only. Null/absent means unscoped (sees both).
+        if (data['data']['floor'] != null) {
+          await prefs.setString('floor', data['data']['floor'].toString());
+        } else {
+          await prefs.remove('floor');
         }
         // Save JWT tokens for authentication
         if (data['tokens'] != null) {
@@ -130,7 +142,7 @@ class ApiService {
     try {
       final url = await _buildUriWithLanguage('${await baseUrl}/api/categories');
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
       
       // If 401, token is invalid - logout user
       if (response.statusCode == 401) {
@@ -208,7 +220,7 @@ class ApiService {
       final response = await http.get(
         url,
         headers: headers,
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -255,7 +267,7 @@ class ApiService {
       final response = await http.get(
         url,
         headers: headers,
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -324,7 +336,7 @@ class ApiService {
         url,
         headers: headers,
         body: jsonEncode(body),
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -387,7 +399,7 @@ class ApiService {
         url,
         headers: headers,
         body: jsonEncode(body),
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -445,7 +457,7 @@ class ApiService {
       final response = await http.get(
         url,
         headers: headers,
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -536,7 +548,7 @@ class ApiService {
     try {
       final url = Uri.parse('${await baseUrl}/api/kitchen/orders');
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -563,7 +575,7 @@ class ApiService {
         url,
         headers: headers,
         body: jsonEncode({'status': status}),
-      );
+      ).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();

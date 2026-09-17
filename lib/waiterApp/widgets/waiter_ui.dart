@@ -116,6 +116,8 @@ StatusInfo orderStatusInfo(int status) {
       return const StatusInfo('Confirmed', Colors.orange);
     case 1:
       return const StatusInfo('Settled', Colors.green);
+    case -1:
+      return const StatusInfo('Cancelled', Colors.red);
     default:
       return const StatusInfo('Unknown', Colors.grey);
   }

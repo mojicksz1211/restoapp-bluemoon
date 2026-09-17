@@ -1699,6 +1699,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
       final result = await ApiService.createOrder(
         orderNo: orderNo,
         tableId: widget.table.id,
+        tableNumber: widget.table.number,
         orderType: _selectedOrderType,
         subtotal: subtotal,
         taxAmount: taxAmount,

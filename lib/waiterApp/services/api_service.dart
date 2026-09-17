@@ -6,15 +6,58 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
 import '../../shared/globals.dart';
+import '../../shared/lan_broadcast_service.dart';
 import '../../shared/offline_sync_service.dart';
+import '../../shared/background_service.dart';
 import 'socket_service.dart';
+
+/// Thrown to short-circuit an online attempt when [OfflineSyncService]
+/// already knows we're offline (from its connectivity tracking) — skips
+/// waiting through a request that's certain to fail, so the offline
+/// fallback below runs immediately instead of after a timeout.
+class _KnownOffline implements Exception {
+  const _KnownOffline();
+  @override
+  String toString() => 'Known offline — skipped online attempt';
+}
 
 class ApiService {
   // Cached base URL to avoid repeated async calls
   static String? _cachedBaseUrl;
   static Map<String, dynamic>? _cachedTopRevenueResponse;
   static DateTime? _cachedTopRevenueTime;
-  
+  // Safety net only, not the primary path — _throwIfKnownOffline() already
+  // skips straight to the offline fallback once OfflineSyncService has
+  // detected the outage. This covers the brief window right as internet
+  // drops, before that detection catches up (WiFi can stay "connected" at
+  // the OS level for up to ~10s after the actual internet goes down).
+  static const Duration _httpTimeout = Duration(seconds: 4);
+
+  /// Skips the online attempt entirely when we already know we're offline,
+  /// instead of waiting out a doomed request. Call at the very top of a
+  /// try block whose catch already has an offline fallback.
+  static void _throwIfKnownOffline() {
+    if (OfflineSyncService.instance.isOffline) {
+      throw const _KnownOffline();
+    }
+  }
+
+  /// Cached menu, keyed by id. Online, an order's item names come back from
+  /// the server (it looks them up from menu_id); offline there's no server,
+  /// so anything constructed locally (the cached order, the LAN broadcast)
+  /// has to look the name up itself or it renders as blank on every screen
+  /// that isn't the cart this order came from.
+  static Future<Map<int, Map<String, dynamic>>> _cachedMenuById() async {
+    final menu = await OfflineSyncService.instance.getCachedMenu();
+    final map = <int, Map<String, dynamic>>{};
+    if (menu == null) return map;
+    for (final m in menu) {
+      final id = (m['id'] as num?)?.toInt();
+      if (id != null) map[id] = m;
+    }
+    return map;
+  }
+
   // Get base URL from config
   static Future<String> get baseUrl async {
     if (_cachedBaseUrl == null) {
@@ -55,6 +98,7 @@ class ApiService {
   // Login API endpoint
   static Future<Map<String, dynamic>> login(String username, String password) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/login');
       
       final response = await http.post(
@@ -67,7 +111,7 @@ class ApiService {
           'username': username,
           'password': password,
         }),
-      );
+      ).timeout(_httpTimeout);
 
       final data = jsonDecode(response.body);
 
@@ -134,9 +178,10 @@ class ApiService {
     
     // Validate token by making a test API call
     try {
+      _throwIfKnownOffline();
       final url = await _buildUriWithLanguage('${await baseUrl}/api/categories');
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
       
       // If 401, token is invalid - logout user
       if (response.statusCode == 401) {
@@ -163,6 +208,9 @@ class ApiService {
     // brand-new connection (fresh branch id, no leftover reconnection state
     // from a session that never managed to connect).
     SocketService.disconnect();
+    // Stop the background foreground-service too — a signed-out device
+    // shouldn't keep a persistent notification/socket connection alive.
+    await BackgroundServiceManager.stop();
   }
 
   // Get authentication headers
@@ -194,6 +242,7 @@ class ApiService {
       'table_id': prefs.getString('table_id'),
       'branch_id': prefs.getString('branch_id'),
       'branch_name': prefs.getString('branch_name'),
+      'floor': prefs.getString('floor'),
     };
   }
 
@@ -207,9 +256,10 @@ class ApiService {
   // Get all categories
   static Future<Map<String, dynamic>> getCategories() async {
     try {
+      _throwIfKnownOffline();
       final url = await _buildUriWithLanguage('${await baseUrl}/api/categories');
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -255,13 +305,14 @@ class ApiService {
   // Get menu items (with optional category filter)
   static Future<Map<String, dynamic>> getMenuItems({int? categoryId}) async {
     try {
+      _throwIfKnownOffline();
       String urlString = '${await baseUrl}/api/menu';
       if (categoryId != null) {
         urlString += '?category_id=$categoryId';
       }
       final url = await _buildUriWithLanguage(urlString);
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -343,13 +394,14 @@ class ApiService {
     }
 
     try {
+      _throwIfKnownOffline();
       final url = await _buildUriWithLanguage('${await baseUrl}/api/menu/top-revenue?limit=$limit');
       final headers = await getAuthHeaders();
 
       final response = await http.get(
         url,
         headers: headers,
-      );
+      ).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -396,9 +448,10 @@ class ApiService {
   // Get all restaurant tables
   static Future<Map<String, dynamic>> getTables() async {
     try {
+      _throwIfKnownOffline();
       final url = await _buildUriWithLanguage('${await baseUrl}/api/tables');
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -443,9 +496,10 @@ class ApiService {
   // Get waiter orders (orders table status)
   static Future<Map<String, dynamic>> getWaiterOrders() async {
     try {
+      _throwIfKnownOffline();
       final url = await _buildUriWithLanguage('${await baseUrl}/api/waiter/orders');
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -515,6 +569,7 @@ class ApiService {
     String? remarks,
   }) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/status');
       final headers = await getAuthHeaders();
 
@@ -530,7 +585,7 @@ class ApiService {
           if (paymentRef != null) 'payment_ref': paymentRef,
           if (remarks != null) 'remarks': remarks,
         }),
-      );
+      ).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -602,6 +657,7 @@ class ApiService {
     required int targetTableId,
   }) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/transfer-table');
       final headers = await getAuthHeaders();
 
@@ -611,7 +667,7 @@ class ApiService {
         body: jsonEncode({
           'target_table_id': targetTableId,
         }),
-      );
+      ).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -660,10 +716,11 @@ class ApiService {
     double qty = 1.0,
   }) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/extend-room-charge');
       final headers = await getAuthHeaders();
 
-      final response = await http.post(url, headers: headers, body: jsonEncode({'qty': qty}));
+      final response = await http.post(url, headers: headers, body: jsonEncode({'qty': qty})).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -707,6 +764,10 @@ class ApiService {
   static Future<Map<String, dynamic>> createOrder({
     required String orderNo,
     int? tableId,
+    // Human-readable table label (e.g. "5", "ROOM 3") — only used to enrich
+    // the LAN-broadcast alert's "Table X" subtitle when this order is
+    // created offline; the online path doesn't need it.
+    String? tableNumber,
     String? orderType,
     double subtotal = 0.0,
     double taxAmount = 0.0,
@@ -716,8 +777,9 @@ class ApiService {
     required List<Map<String, dynamic>> items,
   }) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/orders');
-      
+
       final headers = await getAuthHeaders();
       
       // Prepare request body
@@ -737,7 +799,7 @@ class ApiService {
         url,
         headers: headers,
         body: jsonEncode(body),
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -772,10 +834,12 @@ class ApiService {
     } catch (e) {
       // Offline fallback: create local order with unique temp negative ID & enqueue
       final tempId = OfflineSyncService.instance.generateTempOrderId();
+      final menuById = await _cachedMenuById();
       final offlineOrderData = {
         'order_id': tempId,
         'order_no': orderNo,
         'table_id': tableId,
+        if (tableNumber != null) 'table_number': tableNumber,
         'order_type': orderType,
         'status': 3, // PENDING
         'subtotal': subtotal,
@@ -785,13 +849,19 @@ class ApiService {
         'grand_total': grandTotal,
         'encoded_dt': DateTime.now().toIso8601String(),
         'is_offline': true,
-        'items': items.map((it) => {
-          'menu_id': it['menu_id'],
-          'qty': it['qty'],
-          'unit_price': it['unit_price'],
-          'line_total': ((it['qty'] as num?)?.toDouble() ?? 1.0) * ((it['unit_price'] as num?)?.toDouble() ?? 0.0),
-          'status': it['status'] ?? 3,
-          if (it['remarks'] != null) 'remarks': it['remarks'],
+        'items': items.map((it) {
+          final menuId = (it['menu_id'] as num?)?.toInt();
+          final menuEntry = menuId != null ? menuById[menuId] : null;
+          final menuName = menuEntry?['name'];
+          return {
+            'menu_id': it['menu_id'],
+            if (menuName != null) 'menu_name': menuName,
+            'qty': it['qty'],
+            'unit_price': it['unit_price'],
+            'line_total': ((it['qty'] as num?)?.toDouble() ?? 1.0) * ((it['unit_price'] as num?)?.toDouble() ?? 0.0),
+            'status': it['status'] ?? 3,
+            if (it['remarks'] != null) 'remarks': it['remarks'],
+          };
         }).toList(),
       };
 
@@ -816,6 +886,19 @@ class ApiService {
         },
       );
 
+      // Best-effort real-time notification over the LAN — see
+      // lan_broadcast_service.dart. This is the exact same offline path
+      // (the online POST above already failed/threw), so no extra
+      // online/offline check is needed here.
+      final userData = await getUserData();
+      unawaited(LanBroadcastService.instance.broadcastOrderCreated({
+        'branch_id': await getBranchId(),
+        'order_id': tempId,
+        'order_no': orderNo,
+        'encoded_by': userData['user_id'],
+        'order': offlineOrderData,
+      }));
+
       return {
         'success': true,
         'data': {
@@ -835,6 +918,7 @@ class ApiService {
     required List<Map<String, dynamic>> items,
   }) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/orders/$orderId/items');
       
       final headers = await getAuthHeaders();
@@ -848,7 +932,7 @@ class ApiService {
         url,
         headers: headers,
         body: jsonEncode(body),
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -881,12 +965,50 @@ class ApiService {
         };
       }
     } catch (e) {
-      await OfflineSyncService.instance.addItemsToLocalOrder(orderId, items);
+      final menuById = await _cachedMenuById();
+      final enrichedItems = items.map((it) {
+        final menuId = (it['menu_id'] as num?)?.toInt();
+        final menuEntry = menuId != null ? menuById[menuId] : null;
+        final menuName = menuEntry?['name'];
+        // The online path leaves line_total for the backend to compute, so
+        // callers never set it here — but offline there's no backend to do
+        // that, and every renderer (table card, order alert) reads
+        // item.lineTotal directly with no unit_price*qty fallback. Without
+        // this, an item added offline always displays as ₱0.00. Mirrors the
+        // same computation createOrder()'s offline fallback already does.
+        final qty = (it['qty'] as num?)?.toDouble() ?? 1.0;
+        final unitPrice = (it['unit_price'] as num?)?.toDouble() ?? 0.0;
+        return {
+          ...it,
+          if (menuName != null) 'menu_name': menuName,
+          'line_total': qty * unitPrice,
+        };
+      }).toList();
+
+      await OfflineSyncService.instance.addItemsToLocalOrder(orderId, enrichedItems);
       await OfflineSyncService.instance.enqueueAction(
         type: 'add_items',
         orderId: orderId,
         payload: {'items': items},
       );
+
+      // Best-effort real-time notification over the LAN, mirroring the
+      // create_order path above — read back the just-updated order so the
+      // broadcast carries accurate merged items/totals.
+      final cachedOrders = await OfflineSyncService.instance.getCachedOrders();
+      final updatedOrder = cachedOrders?.firstWhere(
+        (o) => (o['order_id'] ?? o['IDNo'] ?? o['id']) == orderId,
+        orElse: () => <String, dynamic>{},
+      );
+      final userData = await getUserData();
+      unawaited(LanBroadcastService.instance.broadcastOrderItemsAdded({
+        'branch_id': await getBranchId(),
+        'order_id': orderId,
+        'encoded_by': userData['user_id'],
+        'items_added': true,
+        if (updatedOrder != null && updatedOrder.isNotEmpty) 'order': updatedOrder,
+      }));
+
       return {
         'success': true,
         'data': {'order_id': orderId, 'is_offline': true},
@@ -898,6 +1020,7 @@ class ApiService {
   // Get user orders from server (for syncing with local storage)
   static Future<Map<String, dynamic>> getUserOrders() async {
     try {
+      _throwIfKnownOffline();
       final url = await _buildUriWithLanguage('${await baseUrl}/api/orders');
       
       final headers = await getAuthHeaders();
@@ -905,7 +1028,7 @@ class ApiService {
       final response = await http.get(
         url,
         headers: headers,
-      );
+      ).timeout(_httpTimeout);
 
       // Handle 401 Unauthorized - token expired or invalid
       if (response.statusCode == 401) {
@@ -997,6 +1120,7 @@ class ApiService {
     required List<Map<String, dynamic>> items,
   }) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/orders/$orderId/items');
       final headers = await getAuthHeaders();
 
@@ -1006,7 +1130,7 @@ class ApiService {
         body: jsonEncode({
           'items': items,
         }),
-      );
+      ).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -1040,9 +1164,10 @@ class ApiService {
   // Kitchen APIs
   static Future<Map<String, dynamic>> getKitchenOrders() async {
     try {
+      _throwIfKnownOffline();
       final url = await _buildUriWithLanguage('${await baseUrl}/api/kitchen/orders');
       final headers = await getAuthHeaders();
-      final response = await http.get(url, headers: headers);
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();
@@ -1062,6 +1187,7 @@ class ApiService {
 
   static Future<Map<String, dynamic>> updateKitchenOrderStatus(int orderId, int status) async {
     try {
+      _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/kitchen/orders/$orderId/status');
       final headers = await getAuthHeaders();
       // Using POST instead of PATCH to avoid CORS issues on some servers
@@ -1069,7 +1195,7 @@ class ApiService {
         url,
         headers: headers,
         body: jsonEncode({'status': status}),
-      );
+      ).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
         await logout();

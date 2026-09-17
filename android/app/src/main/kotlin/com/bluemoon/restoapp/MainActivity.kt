@@ -1,12 +1,50 @@
 package com.bluemoon.restoapp
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.View
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+    private val batteryChannelName = "com.bluemoon.restoapp/battery"
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, batteryChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "requestIgnoreBatteryOptimizations" -> {
+                        val packageName = applicationContext.packageName
+                        val powerManager =
+                            applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+                        if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                            val intent = Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:$packageName")
+                            )
+                            startActivity(intent)
+                        }
+                        result.success(null)
+                    }
+                    "isIgnoringBatteryOptimizations" -> {
+                        val packageName = applicationContext.packageName
+                        val powerManager =
+                            applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+                        result.success(powerManager.isIgnoringBatteryOptimizations(packageName))
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
     override fun onResume() {
         super.onResume()
         // Enable immersive fullscreen mode

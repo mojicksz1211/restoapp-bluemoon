@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../../shared/widgets/offline_order_badge.dart';
 import '../models.dart' show formatPrice;
 import '../waiter_models.dart';
 import '../widgets/waiter_ui.dart';
@@ -14,6 +15,7 @@ class TablesTab extends StatelessWidget {
   final void Function(WaiterTable table) onAddOrder;
   final void Function(WaiterTable table) onEditOrder;
   final void Function(WaiterTable table) onExtendRoomCharge;
+  final void Function(WaiterOrder order)? onCancelOrder;
   // Lets the sidebar's Occupied/Available submenu reuse this same grid with
   // a pre-filtered `tables` list, just relabeling the header/empty-state
   // text to match — the filtering itself happens in the caller.
@@ -27,6 +29,9 @@ class TablesTab extends StatelessWidget {
   final int total2fAvailableCount;
   final int total2fOccupiedCount;
   final bool showFilterChips;
+  // 'gf', '2f', or null (unscoped). When set, the chip(s) for the *other*
+  // floor are hidden — a floor-scoped account only ever sees its own floor.
+  final String? lockedFloor;
 
   const TablesTab({
     super.key,
@@ -38,6 +43,7 @@ class TablesTab extends StatelessWidget {
     required this.onAddOrder,
     required this.onEditOrder,
     required this.onExtendRoomCharge,
+    this.onCancelOrder,
     this.title = 'Table Monitoring',
     this.emptyMessage = 'No tables found',
     this.currentFilter = 'all',
@@ -48,6 +54,7 @@ class TablesTab extends StatelessWidget {
     this.total2fAvailableCount = 0,
     this.total2fOccupiedCount = 0,
     this.showFilterChips = false,
+    this.lockedFloor,
   });
 
   @override
@@ -75,34 +82,38 @@ class TablesTab extends StatelessWidget {
                     count: totalAllCount,
                     icon: Icons.table_bar_rounded,
                   ),
-                  _buildFilterChip(
-                    key: 'gf_available',
-                    label: 'GF Available',
-                    count: totalGfAvailableCount,
-                    icon: Icons.check_circle_outline_rounded,
-                    accentColor: Colors.green.shade700,
-                  ),
-                  _buildFilterChip(
-                    key: 'gf_occupied',
-                    label: 'GF Occupied',
-                    count: totalGfOccupiedCount,
-                    icon: Icons.person_rounded,
-                    accentColor: Colors.orange.shade700,
-                  ),
-                  _buildFilterChip(
-                    key: '2f_available',
-                    label: '2F Available',
-                    count: total2fAvailableCount,
-                    icon: Icons.check_circle_outline_rounded,
-                    accentColor: Colors.green.shade700,
-                  ),
-                  _buildFilterChip(
-                    key: '2f_occupied',
-                    label: '2F Occupied',
-                    count: total2fOccupiedCount,
-                    icon: Icons.person_rounded,
-                    accentColor: Colors.orange.shade700,
-                  ),
+                  if (lockedFloor != '2f') ...[
+                    _buildFilterChip(
+                      key: 'gf_available',
+                      label: 'GF Available',
+                      count: totalGfAvailableCount,
+                      icon: Icons.check_circle_outline_rounded,
+                      accentColor: Colors.green.shade700,
+                    ),
+                    _buildFilterChip(
+                      key: 'gf_occupied',
+                      label: 'GF Occupied',
+                      count: totalGfOccupiedCount,
+                      icon: Icons.person_rounded,
+                      accentColor: Colors.orange.shade700,
+                    ),
+                  ],
+                  if (lockedFloor != 'gf') ...[
+                    _buildFilterChip(
+                      key: '2f_available',
+                      label: '2F Available',
+                      count: total2fAvailableCount,
+                      icon: Icons.check_circle_outline_rounded,
+                      accentColor: Colors.green.shade700,
+                    ),
+                    _buildFilterChip(
+                      key: '2f_occupied',
+                      label: '2F Occupied',
+                      count: total2fOccupiedCount,
+                      icon: Icons.person_rounded,
+                      accentColor: Colors.orange.shade700,
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -205,16 +216,44 @@ class TablesTab extends StatelessWidget {
     );
   }
 
+  // "ORDER BY TABLE_NUMBER ASC" on the backend is a plain string sort, so
+  // "Room 10"/"Room 11"/.../"Room 13" sort right after "Room 1" and before
+  // "Room 2". Sort by (non-numeric prefix, trailing number) instead so
+  // "Room 1".."Room 13" (and M1..M13, P1..P4, etc.) read in numeric order.
+  static List<WaiterTable> _naturallySortedTables(List<WaiterTable> source) {
+    final sorted = List<WaiterTable>.from(source);
+    sorted.sort((a, b) => _compareTableNumbers(a.number, b.number));
+    return sorted;
+  }
+
+  static int _compareTableNumbers(String a, String b) {
+    final aMatch = RegExp(r'^(.*?)(\d+)\s*$').firstMatch(a.trim());
+    final bMatch = RegExp(r'^(.*?)(\d+)\s*$').firstMatch(b.trim());
+    if (aMatch != null && bMatch != null) {
+      final prefixCompare = aMatch
+          .group(1)!
+          .trim()
+          .toUpperCase()
+          .compareTo(bMatch.group(1)!.trim().toUpperCase());
+      if (prefixCompare != 0) return prefixCompare;
+      final aNum = int.tryParse(aMatch.group(2)!) ?? 0;
+      final bNum = int.tryParse(bMatch.group(2)!) ?? 0;
+      return aNum.compareTo(bNum);
+    }
+    return a.trim().toUpperCase().compareTo(b.trim().toUpperCase());
+  }
+
   Widget _buildTablesGrid(BuildContext context) {
     if (tables.isEmpty) {
       return EmptyState(message: emptyMessage);
     }
 
+    final sortedTables = _naturallySortedTables(tables);
     final tableOrderStatus = _buildTableOrderStatus();
 
     // Room-charge tables that currently have an active order get an extra
     // "Extend Room Charge" button, so those cards need more vertical room.
-    final anyExtendable = tables.any((t) =>
+    final anyExtendable = sortedTables.any((t) =>
         t.hasRoomCharge &&
         orders.any((o) =>
             o.tableId == t.id && (o.status == 2 || o.status == 3)));
@@ -225,7 +264,7 @@ class TablesTab extends StatelessWidget {
     return AnimatedBuilder(
       animation: WaiterCartStore.instance,
       builder: (context, _) {
-        final anyPendingCart = tables.any(
+        final anyPendingCart = sortedTables.any(
             (t) => WaiterCartStore.instance.pendingItemCountForTable(t.id) > 0);
 
         // Size columns off the space this grid actually has, not the full
@@ -248,7 +287,7 @@ class TablesTab extends StatelessWidget {
             return GridView.builder(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
-              itemCount: tables.length,
+              itemCount: sortedTables.length,
               gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                 crossAxisCount: crossAxisCount,
                 crossAxisSpacing: 12,
@@ -257,7 +296,7 @@ class TablesTab extends StatelessWidget {
                     (anyPendingCart ? 58 : 0),
               ),
               itemBuilder: (context, index) {
-                final table = tables[index];
+                final table = sortedTables[index];
                 final statusInfo = statusInfoFor(table.status);
                 final orderStatusInfo = tableOrderStatus[table.id] ??
                     const StatusInfo('No Order', Colors.grey);
@@ -275,6 +314,7 @@ class TablesTab extends StatelessWidget {
                   onAddOrder: onAddOrder,
                   onEditOrder: onEditOrder,
                   onExtendRoomCharge: onExtendRoomCharge,
+                  onCancelOrder: onCancelOrder,
                 );
               },
             );
@@ -318,6 +358,7 @@ class _TableCard extends StatelessWidget {
   final void Function(WaiterTable table) onAddOrder;
   final void Function(WaiterTable table) onEditOrder;
   final void Function(WaiterTable table) onExtendRoomCharge;
+  final void Function(WaiterOrder order)? onCancelOrder;
 
   const _TableCard({
     required this.table,
@@ -331,6 +372,7 @@ class _TableCard extends StatelessWidget {
     required this.onAddOrder,
     required this.onEditOrder,
     required this.onExtendRoomCharge,
+    this.onCancelOrder,
   });
 
   static const _navy = Color(0xFF0C0E2B);
@@ -350,13 +392,23 @@ class _TableCard extends StatelessWidget {
     final hasActiveOrder = orders.any((o) =>
         o.tableId == table.id && (o.status == 2 || o.status == 3));
     final showExtend = table.hasRoomCharge && hasActiveOrder;
+    WaiterOrder? activeOrder;
+    for (final o in orders) {
+      if (o.tableId == table.id && (o.status == 2 || o.status == 3)) {
+        activeOrder = o;
+        break;
+      }
+    }
 
     final rawName = table.number.trim();
     final cleanTableName = rawName.toLowerCase().startsWith('table')
         ? rawName.substring(5).trim()
         : rawName;
 
-    return Material(
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Material(
       color: Colors.transparent,
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
@@ -437,6 +489,13 @@ class _TableCard extends StatelessWidget {
                   ),
                 ],
               ),
+              if (activeOrder != null) ...[
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OfflineOrderBadge(orderId: activeOrder.id),
+                ),
+              ],
               const SizedBox(height: 10),
               if (hasPendingCart) ...[
                 Container(
@@ -599,6 +658,33 @@ class _TableCard extends StatelessWidget {
           ),
         ),
       ),
+        ),
+        // Circular X button floating at the top-right corner, only when
+        // there's an active order on this table to cancel.
+        if (activeOrder != null && onCancelOrder != null)
+          Positioned(
+            top: -8,
+            right: -8,
+            child: Material(
+              color: Colors.white,
+              shape: const CircleBorder(),
+              elevation: 3,
+              child: InkWell(
+                customBorder: const CircleBorder(),
+                onTap: () => onCancelOrder!(activeOrder!),
+                child: Container(
+                  width: 26,
+                  height: 26,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.red.shade200),
+                  ),
+                  child: Icon(Icons.close_rounded, size: 16, color: Colors.red.shade700),
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }

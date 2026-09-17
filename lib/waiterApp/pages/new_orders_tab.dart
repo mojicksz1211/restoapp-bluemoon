@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../../shared/widgets/offline_order_badge.dart';
 import '../waiter_models.dart';
 import '../widgets/waiter_ui.dart';
 
@@ -311,6 +312,8 @@ class _OrderCard extends StatelessWidget {
                   ),
                 ),
               ),
+              OfflineOrderBadge(orderId: order.id),
+              const SizedBox(width: 6),
               StatusChip(status: order.status),
             ],
           ),

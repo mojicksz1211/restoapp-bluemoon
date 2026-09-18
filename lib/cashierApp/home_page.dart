@@ -20,6 +20,7 @@ import '../shared/background_service.dart';
 import '../shared/offline_sync_service.dart';
 import '../shared/widgets/offline_order_badge.dart';
 import '../shared/widgets/offline_sync_banner.dart';
+import '../shared/update_dialog.dart';
 
 class SettlementData {
   final String paymentMethod;
@@ -341,6 +342,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     _loadFloorScope().then((_) => _loadData()).then((_) => _checkPendingBackgroundAlerts());
     _initializeSocket();
     BackgroundServiceManager.ensureStarted();
+    checkAndPromptAppUpdate(context);
     languageNotifier.addListener(_onLanguageChanged);
     // Belt-and-suspenders: socket_io_client has NO real HTTP-polling fallback
     // on native platforms (io_transports.dart hardcodes WebSocketTransport

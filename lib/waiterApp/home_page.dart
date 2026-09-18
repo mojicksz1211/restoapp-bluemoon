@@ -26,6 +26,7 @@ import '../shared/lan_broadcast_service.dart';
 import '../shared/background_service.dart';
 import '../shared/offline_sync_service.dart';
 import '../shared/widgets/offline_sync_banner.dart';
+import '../shared/update_dialog.dart';
 
 class WaiterHomePage extends StatefulWidget {
   const WaiterHomePage({super.key});
@@ -81,6 +82,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     _loadBranchId().then((_) => _loadData());
     _initializeSocket();
     BackgroundServiceManager.ensureStarted();
+    checkAndPromptAppUpdate(context);
     _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (mounted && !SocketService.isConnected) _pollData();
     });
@@ -2196,6 +2198,14 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                                 child: CircularProgressIndicator(strokeWidth: 2),
                               )
                             : const Icon(Icons.refresh),
+                      ),
+                      IconButton(
+                        tooltip: 'Settings',
+                        onPressed: () => showAppSettingsSheet(
+                          context: context,
+                          onLogout: logout,
+                        ),
+                        icon: const Icon(Icons.settings_outlined),
                       ),
                       IconButton(
                         tooltip: 'Logout',

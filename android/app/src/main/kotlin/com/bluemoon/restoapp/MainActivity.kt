@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.View
@@ -58,7 +60,17 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    // Applying an immersive system-UI change at the exact instant the screen
+    // wakes from fully off (e.g. the cashier full-screen wake-alert notification
+    // - see background_service.dart) has been observed to leave the display
+    // stuck on a stale frame until the screen is manually power-cycled, on top
+    // of OEM lock-screen compositing (Samsung/Lenovo). A short defer lets the
+    // compositor settle after wake before changing system bar visibility.
     private fun enableFullscreen() {
+        Handler(Looper.getMainLooper()).postDelayed({ applyFullscreen() }, 300)
+    }
+
+    private fun applyFullscreen() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Android 11+ (API 30+)
             window.insetsController?.let { controller ->

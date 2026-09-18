@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../shared/globals.dart';
 import '../shared/app_translations.dart';
+import '../shared/update_dialog.dart';
 
 typedef AsyncCallback = Future<void> Function();
 
@@ -42,6 +43,7 @@ class _AppSettingsSheetState extends State<_AppSettingsSheet> {
 
   String _selectedLanguage = 'en';
   bool _loadingLanguage = true;
+  bool _checkingUpdate = false;
 
   @override
   void initState() {
@@ -58,6 +60,13 @@ class _AppSettingsSheetState extends State<_AppSettingsSheet> {
       _loadingLanguage = false;
     });
     setAppLanguage(lang);
+  }
+
+  Future<void> _checkForUpdate() async {
+    if (_checkingUpdate) return;
+    setState(() => _checkingUpdate = true);
+    await checkForUpdateManually(context);
+    if (mounted) setState(() => _checkingUpdate = false);
   }
 
   Future<void> _setLanguage(String code) async {
@@ -155,6 +164,26 @@ class _AppSettingsSheetState extends State<_AppSettingsSheet> {
                         },
                       ),
                     ),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.system_update, color: Color(0xFF0C0E2B)),
+              title: Text(
+                'check_for_updates'.tr,
+                style: GoogleFonts.urbanist(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF4A4945),
+                ),
+              ),
+              trailing: _checkingUpdate
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : null,
+              onTap: _checkingUpdate ? null : _checkForUpdate,
             ),
             if (widget.onLogout != null)
               ListTile(

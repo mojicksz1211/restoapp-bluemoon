@@ -345,13 +345,27 @@ class OfflineSyncService {
   /// is what makes "back online" feel instant rather than laggy.
   void _startConnectivityListener() {
     _connectivitySubscription?.cancel();
-    _connectivitySubscription = Connectivity().onConnectivityChanged.listen((results) {
-      final hasLink = results.any((r) => r != ConnectivityResult.none);
-      if (hasLink) {
-        debugPrint('[OFFLINE SYNC] Connectivity link detected — probing reachability immediately');
-        unawaited(probeReachability());
-      }
-    });
+    _connectivitySubscription = Connectivity().onConnectivityChanged.listen(
+      (results) {
+        final hasLink = results.any((r) => r != ConnectivityResult.none);
+        if (hasLink) {
+          debugPrint('[OFFLINE SYNC] Connectivity link detected — probing reachability immediately');
+          unawaited(probeReachability());
+        }
+      },
+      // A plain try/catch around .listen() wouldn't catch this: the platform
+      // channel failure (seen on web when connectivity_plus's web
+      // implementation isn't registered - MissingPluginException on
+      // dev.fluttercommunity.plus/connectivity_status) arrives later as a
+      // stream error event, not a synchronous throw. Without this handler it
+      // surfaces as an uncaught error in the browser console. The 10s
+      // _startReachabilityProbe() timer already covers connectivity
+      // detection as a backstop, so losing this "instant" listener on a
+      // platform where it can't register is a quiet degrade, not a break.
+      onError: (Object e) {
+        debugPrint('[OFFLINE SYNC] Connectivity listener unavailable on this platform: $e');
+      },
+    );
   }
 
   // ===========================================================================

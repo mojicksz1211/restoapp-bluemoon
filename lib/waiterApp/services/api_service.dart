@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
+import '../../shared/floor_utils.dart';
 import '../../shared/globals.dart';
 import '../../shared/lan_broadcast_service.dart';
 import '../../shared/offline_sync_service.dart';
@@ -776,17 +777,21 @@ class ApiService {
     double grandTotal = 0.0,
     required List<Map<String, dynamic>> items,
   }) async {
+    // The creating account's floor ('gf' / '2f', null if unscoped) is stamped
+    // on the order so each floor's staff only see their own floor's orders.
+    final floor = normalizeFloor((await getUserData())['floor']);
     try {
       _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/orders');
 
       final headers = await getAuthHeaders();
-      
+
       // Prepare request body
       final body = {
         'order_no': orderNo,
         if (tableId != null) 'table_id': tableId,
         if (orderType != null) 'order_type': orderType,
+        if (floor != null) 'floor': floor,
         'subtotal': subtotal,
         'tax_amount': taxAmount,
         'service_charge': serviceCharge,
@@ -841,6 +846,7 @@ class ApiService {
         'table_id': tableId,
         if (tableNumber != null) 'table_number': tableNumber,
         'order_type': orderType,
+        if (floor != null) 'floor': floor,
         'status': 3, // PENDING
         'subtotal': subtotal,
         'tax_amount': taxAmount,
@@ -874,6 +880,7 @@ class ApiService {
           'order_no': orderNo,
           if (tableId != null) 'table_id': tableId,
           if (orderType != null) 'order_type': orderType,
+          if (floor != null) 'floor': floor,
           'subtotal': subtotal,
           'tax_amount': taxAmount,
           'service_charge': serviceCharge,

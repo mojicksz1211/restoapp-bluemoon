@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
+import '../../shared/floor_utils.dart';
 import '../../shared/globals.dart';
 import 'socket_service.dart';
 
@@ -316,14 +317,16 @@ class ApiService {
   }) async {
     try {
       final url = Uri.parse('${await baseUrl}/api/orders');
-      
+
       final headers = await getAuthHeaders();
-      
+      final floor = normalizeFloor((await getUserData())['floor']);
+
       // Prepare request body
       final body = {
         'order_no': orderNo,
         if (tableId != null) 'table_id': tableId,
         if (orderType != null) 'order_type': orderType,
+        if (floor != null) 'floor': floor,
         'subtotal': subtotal,
         'tax_amount': taxAmount,
         'service_charge': serviceCharge,

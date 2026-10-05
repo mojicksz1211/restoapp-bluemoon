@@ -7,6 +7,7 @@ import '../waiterApp/waiter_models.dart';
 import '../waiterApp/services/api_service.dart';
 import '../waiterApp/services/socket_service.dart';
 import '../shared/sound_service.dart';
+import '../shared/floor_utils.dart';
 import '../shared/globals.dart';
 import '../waiterApp/pages/get_order_page.dart' as waiter_order;
 import 'widgets/bill_out_modal.dart';
@@ -274,6 +275,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   }
 
   bool _isGroundFloorOrder(WaiterOrder order) {
+    // The order's own floor (from its creator's account) wins over the
+    // table-name heuristic below.
+    final orderFloor = normalizeFloor(order.floor);
+    if (orderFloor != null) return orderFloor == kFloorGround;
     final numStr = (order.tableNumber ?? '').toUpperCase().trim();
     final roomMatch = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(numStr);
     if (roomMatch != null) {
@@ -291,6 +296,8 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   // cashier's own takeout-order alert.
   bool _isOrderVisibleForFloorScope(WaiterOrder order) {
     if (_floorScope != 'gf' && _floorScope != '2f') return true;
+    final orderFloor = normalizeFloor(order.floor);
+    if (orderFloor != null) return orderFloor == _floorScope;
     final tableNumber = order.tableNumber;
     if (tableNumber == null || tableNumber.trim().isEmpty) return true;
     final wantGf = _floorScope == 'gf';

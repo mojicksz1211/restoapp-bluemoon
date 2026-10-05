@@ -1,3 +1,5 @@
+import '../shared/floor_utils.dart';
+
 class WaiterTable {
   final int id;
   final String number;
@@ -64,6 +66,10 @@ class WaiterOrder {
   final double amountPaid;
   final String? paymentRef;
   final String? encodedByName;
+  // Floor of the account that created the order ('gf' / '2f', from
+  // user_info.FLOOR). Null for older orders or an unscoped creator — callers
+  // then fall back to the table-name heuristic.
+  final String? floor;
 
   WaiterOrder({
     required this.id,
@@ -84,6 +90,7 @@ class WaiterOrder {
     this.amountPaid = 0,
     this.paymentRef,
     this.encodedByName,
+    this.floor,
   }) : items = consolidateItems(items);
 
   /// Consolidates items by menuId or trimmed name so multiple entries of the same item
@@ -172,6 +179,7 @@ class WaiterOrder {
       amountPaid: _parseDouble(data['amount_paid'] ?? data['amountPaid'] ?? data['AMOUNT_PAID']),
       paymentRef: (data['payment_ref'] ?? data['paymentRef'] ?? data['PAYMENT_REF'])?.toString(),
       encodedByName: (data['encoded_by_name'] ?? data['encodedByName'] ?? data['ENCODED_BY_NAME'])?.toString(),
+      floor: normalizeFloor(data['floor'] ?? data['FLOOR']),
     );
   }
 
@@ -210,6 +218,7 @@ class WaiterOrder {
       amountPaid: amountPaid ?? this.amountPaid,
       paymentRef: paymentRef ?? this.paymentRef,
       encodedByName: encodedByName ?? this.encodedByName,
+      floor: floor,
     );
   }
 

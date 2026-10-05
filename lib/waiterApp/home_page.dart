@@ -8,6 +8,7 @@ import 'waiter_models.dart';
 import 'services/api_service.dart';
 import 'services/socket_service.dart';
 import 'services/waiter_cart_store.dart';
+import '../shared/floor_utils.dart';
 import '../shared/globals.dart';
 import '../shared/settings_sheet.dart';
 import 'widgets/confirm_order_bottom_sheet.dart';
@@ -136,13 +137,16 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     return tables.where((t) => _isGroundFloorTable(t) == wantGf).toList();
   }
 
-  // Orders don't carry a floor field (same as tables — inferred from the
-  // table-name convention above). Orders with no table (e.g. takeout) aren't
-  // tied to a floor, so they always stay visible regardless of scope —
-  // otherwise a floor-scoped waiter's own takeout order would vanish from
-  // their own New Orders tab.
+  // An order's own floor (stamped from its creator's user_info.FLOOR) wins.
+  // Older orders, or ones made by an unscoped account, have none and fall
+  // back to the table-name convention above. Those with no table (e.g.
+  // takeout) aren't tied to a floor, so they always stay visible regardless
+  // of scope — otherwise a floor-scoped waiter's own takeout order would
+  // vanish from their own New Orders tab.
   bool _isOrderVisibleForFloorScope(WaiterOrder order) {
     if (_floorScope != 'gf' && _floorScope != '2f') return true;
+    final orderFloor = normalizeFloor(order.floor);
+    if (orderFloor != null) return orderFloor == _floorScope;
     final tableNumber = order.tableNumber;
     if (tableNumber == null || tableNumber.trim().isEmpty) return true;
     final wantGf = _floorScope == 'gf';

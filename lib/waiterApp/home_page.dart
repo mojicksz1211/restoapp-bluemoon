@@ -16,18 +16,25 @@ import 'widgets/edit_order_bottom_sheet.dart';
 import 'widgets/menu_picker_sheet.dart';
 import 'widgets/waiter_ui.dart';
 import 'widgets/waiter_sidebar.dart';
-import 'widgets/center_popup.dart';
 import 'widgets/transfer_table_modal.dart';
 import 'widgets/extend_room_charge_dialog.dart';
-import 'services/notification_service.dart';
+import 'widgets/room_charge_history.dart';
+import 'widgets/room_time_warning.dart';
 import 'pages/get_order_page.dart';
+import 'pages/take_out_launcher.dart';
+import 'pages/quick_menu_page.dart' show QuickMenuBrand;
 import 'pages/tables_tab.dart';
 import 'pages/new_orders_tab.dart';
 import '../shared/lan_broadcast_service.dart';
 import '../shared/background_service.dart';
 import '../shared/offline_sync_service.dart';
 import '../shared/widgets/offline_sync_banner.dart';
+import '../shared/widgets/loading_overlay.dart';
+import '../shared/widgets/cancel_order_dialog.dart';
+import '../shared/widgets/floating_result.dart';
+import '../shared/widgets/sliding_segments.dart';
 import '../shared/update_dialog.dart';
+import '../shared/widgets/blurred_dialog.dart';
 
 class WaiterHomePage extends StatefulWidget {
   const WaiterHomePage({super.key});
@@ -36,7 +43,8 @@ class WaiterHomePage extends StatefulWidget {
   State<WaiterHomePage> createState() => _WaiterHomePageState();
 }
 
-class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStateMixin {
+class _WaiterHomePageState extends State<WaiterHomePage>
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   bool _isLoading = true;
   String? _errorMessage;
@@ -44,7 +52,6 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   List<WaiterOrder> _orders = [];
   List<MenuItem> _menuItems = [];
   int? _branchId;
-  String? _currentUserId;
   // 'gf', '2f', or null (unscoped — sees both floors). Set per-account by an
   // admin via the FLOOR column on user_info; restricts this account to only
   // its own floor's tables/orders.
@@ -64,18 +71,40 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   VoidCallback? _disposeTableUpdated;
   VoidCallback? _disposeLanOrderCreated;
   VoidCallback? _disposeLanOrderItemsAdded;
-  // Cached from DefaultTabController.of(...) in build() — the "View Order"
-  // action on the New Order Received popup needs to switch tabs from a
-  // socket callback, outside build()'s scope where the controller normally
-  // lives as a local variable.
-  TabController? _tabController;
   // Sidebar's Occupied/Available submenu under "Tables" — 'all' | 'occupied'
   // | 'available'. Only meaningful while the Tables tab (index 0) is active.
   String _tableFilter = 'all';
+  // "15 minutes left" popup for rooms with a room charge.
+  late final RoomTimeWarningController _roomTimeWarnings = RoomTimeWarningController(
+    orders: () => _orders.where(_isOrderVisibleForFloorScope),
+    context: () => mounted ? context : null,
+    fallbackRateFor: _roomRateForOrder,
+    onExtend: (order) {
+      WaiterTable? table;
+      for (final t in _tables) {
+        if (t.id == order.tableId) table = t;
+      }
+      final tableId = order.tableId;
+      if (table == null && tableId == null) return Future.value();
+      return _extendRoomChargeForTable(table ??
+          WaiterTable(
+            id: tableId!,
+            number: order.tableNumber ?? 'Room',
+            capacity: 0,
+            status: 2,
+            roomCharge: _roomRateForOrder(order),
+          ));
+    },
+  );
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // The background service only shows its notifications (room time,
+    // alerts) while the app isn't on screen.
+    BackgroundServiceManager.reportUiForeground(true);
+    _roomTimeWarnings.start();
     WaiterCartStore.instance.restore();
     OfflineSyncService.instance.addDataSyncedListener(_onDataSynced);
     // Floor scope must be known before the first table fetch resolves, so a
@@ -104,7 +133,6 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     if (!mounted) return;
     setState(() {
       _branchId = branchId;
-      _currentUserId = userData['user_id'];
       _floorScope = userData['floor'];
     });
   }
@@ -164,10 +192,20 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _roomTimeWarnings.dispose();
     OfflineSyncService.instance.removeDataSyncedListener(_onDataSynced);
     _pollTimer?.cancel();
     _cleanupSocket();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    final resumed = state == AppLifecycleState.resumed;
+    BackgroundServiceManager.reportUiForeground(resumed);
+    if (resumed) _roomTimeWarnings.check();
   }
 
   /// Lightweight fallback poll (2s) for when the socket isn't connected:
@@ -211,20 +249,20 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     if (_isManualRefreshing) return;
     setState(() => _isManualRefreshing = true);
     try {
-      await _loadData(showSpinner: false);
+      // Blocking loader so the tap clearly did something. A refresh is often
+      // over in a blink, so keep it up for a minimum of 700ms or the card
+      // would just flash.
+      await runWithLoader<void>(
+        context,
+        message: 'Refreshing…',
+        task: () => Future.wait<void>([
+          _loadData(showSpinner: false),
+          Future<void>.delayed(const Duration(milliseconds: 700)),
+        ]),
+      );
     } finally {
       if (mounted) setState(() => _isManualRefreshing = false);
     }
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        const SnackBar(
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 1),
-          content: Text('Refreshed'),
-        ),
-      );
   }
 
   Future<void> _loadData({bool showSpinner = true}) async {
@@ -338,10 +376,16 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       return;
     }
 
-    final result = await ApiService.updateWaiterOrderStatus(
-      orderId: order.id,
-      status: 2,
+    if (!mounted) return;
+    final result = await runWithLoader<Map<String, dynamic>>(
+      context,
+      message: 'Confirming order…',
+      task: () => ApiService.updateWaiterOrderStatus(
+        orderId: order.id,
+        status: 2,
+      ),
     );
+    if (!mounted) return;
 
     if (result['unauthorized'] == true) {
       await _redirectToLogin();
@@ -357,27 +401,19 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
           return o;
         }).toList();
       });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '${order.orderNo ?? 'Order #${order.id}'} confirmed successfully.',
-            ),
-            backgroundColor: Colors.green,
-          ),
-        );
-      }
+      showFloatingResult(
+        context,
+        title: 'Order Confirmed',
+        subtitle: order.orderNo ?? 'Order #${order.id}',
+      );
       return;
     }
 
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(result['error'] ?? 'Failed to confirm order'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
+    showFloatingError(
+      context,
+      title: 'Order not confirmed',
+      message: (result['error'] ?? 'Failed to confirm order').toString(),
+    );
   }
 
   Future<void> _initializeSocket() async {
@@ -414,18 +450,17 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       });
 
       // LAN fallback: same handler, just fed from a WiFi-local broadcast
-      // instead of the cloud socket — see lan_broadcast_service.dart. Alerts
-      // stay cashierApp-only even for this offline path, so allowAlert:false.
+      // instead of the cloud socket — see lan_broadcast_service.dart.
       _disposeLanOrderCreated?.call();
       _disposeLanOrderCreated = LanBroadcastService.instance.addOrderCreatedListener((data) {
         if (!mounted) return;
-        _handleSocketOrderEvent(data, allowAlert: false);
+        _handleSocketOrderEvent(data);
       });
 
       _disposeLanOrderItemsAdded?.call();
       _disposeLanOrderItemsAdded = LanBroadcastService.instance.addOrderItemsAddedListener((data) {
         if (!mounted) return;
-        _handleSocketOrderEvent(data, allowAlert: false);
+        _handleSocketOrderEvent(data);
       });
 
       _syncSocketOrderRooms();
@@ -434,7 +469,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     }
   }
 
-  void _handleSocketOrderEvent(Map<String, dynamic> data, {bool allowAlert = true}) {
+  void _handleSocketOrderEvent(Map<String, dynamic> data) {
     // Ignore other branches' realtime traffic (defensive — the backend already
     // emits to per-branch rooms).
     final rawOrderData = data['order'];
@@ -474,19 +509,13 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     try {
       final normalized = _normalizeSocketOrder(orderData);
-      final updatedOrder = WaiterOrder.fromApi(normalized);
-
-      // Check if this is a new pending order (status == 3)
-      final isNewPendingOrder = existingIndex == -1 && updatedOrder.status == 3;
-
-      // Don't alert the waiter about an order they just placed themselves —
-      // the "New Order Received" banner is meant to notify OTHER staff.
-      final creatorId = orderData['encoded_by']?.toString();
-      final isOwnOrder = creatorId != null &&
-          _currentUserId != null &&
-          creatorId == _currentUserId;
+      final parsed = WaiterOrder.fromApi(normalized);
+      final updatedOrder = existingIndex == -1
+          ? parsed
+          : _orders[existingIndex].keepRoomChargesIn(parsed, normalized);
 
       setState(() {
+        final before = existingIndex == -1 ? null : _orders[existingIndex];
         if (existingIndex == -1) {
           _orders = [..._orders, updatedOrder];
         } else {
@@ -494,6 +523,9 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
           nextOrders[existingIndex] = updatedOrder;
           _orders = nextOrders;
         }
+        // Moved / settled / cancelled (from any tablet): free the room it left
+        // right away, even if the server's table_updated event never arrives.
+        _tables = applyOrderTableChange(_tables, _orders, before, updatedOrder);
       });
       _syncSocketOrderRooms();
 
@@ -504,17 +536,6 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       // Persist it locally so that fallback sees it too.
       if (OfflineSyncService.instance.isOffline) {
         unawaited(OfflineSyncService.instance.upsertCachedOrder(normalized));
-      }
-
-      // Show alert for new pending orders placed by someone else. Only for
-      // the real (online) socket path — allowAlert:false for the LAN
-      // fallback keeps offline-mode notifications cashierApp-only.
-      if (allowAlert &&
-          isNewPendingOrder &&
-          !isOwnOrder &&
-          mounted &&
-          _isOrderVisibleForFloorScope(updatedOrder)) {
-        _showNewOrderAlert(updatedOrder);
       }
     } catch (e) {
       debugPrint('Error updating order from socket in waiter_home_page: $e');
@@ -581,36 +602,6 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       SocketService.leaveOrder(id);
       _joinedOrderIds.remove(id);
     }
-  }
-
-  void _showNewOrderAlert(WaiterOrder order) {
-    final orderNo = order.orderNo ?? 'Order #${order.id}';
-    final tableNumber = order.tableNumber;
-
-    // Show local notification (works even in background/sleep)
-    NotificationService.showNewOrderNotification(
-      orderNo: orderNo,
-      tableNumber: tableNumber,
-    );
-
-    // Play system notification sound (only if app is in foreground)
-    SystemSound.play(SystemSoundType.alert);
-
-    // Haptic feedback for better user experience (only if app is in foreground)
-    HapticFeedback.mediumImpact();
-
-    // Centered popup (only if app is in foreground) — more visible than the
-    // old top-slide banner. Stays open until the waiter dismisses it.
-    showCenterPopup(
-      context,
-      icon: Icons.notifications_active,
-      accentColor: const Color(0xFFE8C468),
-      title: 'New Order Received!',
-      subtitle: tableNumber != null ? '$orderNo • Table $tableNumber' : orderNo,
-      actionLabel: 'View Order',
-      onAction: () => _tabController?.animateTo(1),
-      shakeIcon: true,
-    );
   }
 
   void _handleSocketTableEvent(Map<String, dynamic> data) {
@@ -686,11 +677,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     if (_menuItems.isEmpty) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No menu items available to edit this order.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot edit order',
+          message: 'No menu items available to edit this order.',
         );
       }
       return;
@@ -709,11 +699,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     if (editableItems.isEmpty) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No editable items found for this order.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot edit order',
+          message: 'No editable items found for this order.',
         );
       }
       return;
@@ -724,11 +713,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     if (updatedItems == null) return;
     if (updatedItems.isEmpty) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Order must have at least one item.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot save order',
+          message: 'Order must have at least one item.',
         );
       }
       return;
@@ -736,11 +724,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     if (updatedItems.any((item) => item.menuId == null)) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Please select a menu for all items.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot save order',
+          message: 'Please select a menu for all items.',
         );
       }
       return;
@@ -755,10 +742,16 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       };
     }).toList();
 
-    final result = await ApiService.replaceOrderItems(
-      orderId: order.id,
-      items: payload,
+    if (!mounted) return;
+    final result = await runWithLoader<Map<String, dynamic>>(
+      context,
+      message: 'Updating order…',
+      task: () => ApiService.replaceOrderItems(
+        orderId: order.id,
+        items: payload,
+      ),
     );
+    if (!mounted) return;
 
     if (result['unauthorized'] == true) {
       await _redirectToLogin();
@@ -796,26 +789,19 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
         }).toList();
       });
 
-      if (mounted) {
-        showCenterPopup(
-          context,
-          icon: Icons.check_circle,
-          accentColor: Colors.green,
-          title: 'Order Updated Successfully!',
-          subtitle: order.orderNo ?? 'Order #${order.id}',
-        );
-      }
+      showFloatingResult(
+        context,
+        title: 'Order Updated',
+        subtitle: order.orderNo ?? 'Order #${order.id}',
+      );
       return;
     }
 
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(result['error'] ?? 'Failed to update order'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
+    showFloatingError(
+      context,
+      title: 'Order not updated',
+      message: (result['error'] ?? 'Failed to update order').toString(),
+    );
   }
 
   // Cancelling reuses the same status-update endpoint used to settle/confirm
@@ -824,40 +810,40 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   // existing cancel button in the admin web panel and cashierApp.
   Future<void> _cancelOrder(WaiterOrder order) async {
     if (order.id < 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
-          ),
-          backgroundColor: Color(0xFFD97706),
-        ),
+      showFloatingResult(
+        context,
+        title: 'Not synced yet',
+        subtitle: 'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+        warning: true,
+        duration: const Duration(milliseconds: 3200),
       );
       return;
     }
 
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Cancel order?'),
-        content: Text('Are you sure you want to cancel ${order.orderNo ?? 'order #${order.id}'}?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('No'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Yes, cancel'),
-          ),
-        ],
-      ),
+    final tableText = (order.tableNumber ?? '').trim();
+    final confirmed = await showCancelOrderConfirm(
+      context,
+      orderLabel: order.orderNo ?? 'Order #${order.id}',
+      tableName: tableText.isEmpty
+          ? (order.isTakeOut ? order.takeOutLabel : null)
+          : (tableText.toLowerCase().startsWith('table') ? tableText : 'Table $tableText'),
     );
-    if (confirmed != true) return;
+    if (!confirmed) return;
 
-    final result = await ApiService.updateWaiterOrderStatus(
-      orderId: order.id,
-      status: -1,
+    if (!mounted) return;
+    // Loader stays up through the cancel call AND the list refresh, so the
+    // card doesn't linger on screen after the waiter has confirmed.
+    final result = await runWithLoader<Map<String, dynamic>>(
+      context,
+      message: 'Cancelling order…',
+      task: () async {
+        final r = await ApiService.updateWaiterOrderStatus(
+          orderId: order.id,
+          status: -1,
+        );
+        if (r['success'] == true) await _loadData(showSpinner: false);
+        return r;
+      },
     );
 
     if (result['unauthorized'] == true) {
@@ -866,20 +852,23 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     }
 
     if (result['success'] == true) {
-      await _loadData(showSpinner: false);
       if (mounted) {
         final isOffline = result['is_offline'] == true;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(isOffline ? 'Order cancelled locally (Offline). Will auto-sync when online.' : 'Order cancelled'),
-            backgroundColor: isOffline ? const Color(0xFFD97706) : Colors.red,
-          ),
+        showFloatingResult(
+          context,
+          title: 'Order Cancelled',
+          subtitle: isOffline
+              ? 'Saved offline - will sync when online'
+              : (order.orderNo ?? 'Order #${order.id}'),
+          warning: isOffline,
         );
       }
     } else {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(result['error'] ?? 'Failed to cancel order'), backgroundColor: Colors.red),
+        showFloatingError(
+          context,
+          title: 'Order not cancelled',
+          message: (result['error'] ?? 'Failed to cancel order').toString(),
         );
       }
     }
@@ -899,11 +888,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     if (table == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Could not find this order\'s table.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Table not found',
+          message: 'Could not find this order\'s table.',
         );
       }
       return;
@@ -956,11 +944,12 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     if (tableOrder == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('No order found for Table ${table.number}'),
-            backgroundColor: Colors.orange,
-          ),
+        showFloatingResult(
+          context,
+          title: 'No order found',
+          subtitle: 'No order found for Table ${table.number}',
+          warning: true,
+          duration: const Duration(milliseconds: 3200),
         );
       }
       return;
@@ -986,11 +975,12 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     if (tableOrder == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('No order found for Table ${table.number}'),
-            backgroundColor: Colors.orange,
-          ),
+        showFloatingResult(
+          context,
+          title: 'No order found',
+          subtitle: 'No order found for Table ${table.number}',
+          warning: true,
+          duration: const Duration(milliseconds: 3200),
         );
       }
       return;
@@ -1013,40 +1003,44 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
     if (tableOrder == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('No active order to extend for ${table.number}'),
-            backgroundColor: Colors.orange,
-          ),
+        showFloatingResult(
+          context,
+          title: 'Nothing to extend',
+          subtitle: 'No active order to extend for ${table.number}',
+          warning: true,
+          duration: const Duration(milliseconds: 3200),
         );
       }
       return;
     }
 
     final order = tableOrder;
-    final qty = await showExtendRoomChargeConfirm(
+    // With room-charge history only the room it's in now is adjusted; rooms
+    // it moved out of keep what they were billed.
+    final currentRoom = order.currentRoomCharge;
+    final rate = currentRoom?.rate ?? table.roomCharge;
+    final sessions = await showRoomChargeAdjust(
       context,
       tableName: table.number,
       orderLabel: order.orderNo ?? '#${order.id}',
-      roomCharge: table.roomCharge,
-      currentRoomCharge: order.serviceCharge,
+      roomCharge: rate,
+      currentRoomCharge: currentRoom?.amount ?? order.serviceCharge,
+      earlierRoomCharge: currentRoom == null ? 0 : order.roomChargesTotal - currentRoom.amount,
     );
 
-    if (qty == null || qty <= 0 || !mounted) return;
+    if (sessions == null || !mounted) return;
 
-    final result = await ApiService.extendRoomCharge(orderId: order.id, qty: qty);
+    final result = await ApiService.setRoomChargeSessions(orderId: order.id, sessions: sessions);
     if (!mounted) return;
 
     if (result['success'] == true) {
       final data = result['data'] as Map<String, dynamic>?;
-      final added = (data?['room_charge_added'] as num?)?.toDouble() ?? table.roomCharge;
       final newServiceCharge = (data?['service_charge'] as num?)?.toDouble() ??
-          (order.serviceCharge + added);
+          (order.serviceCharge + rate * sessions - (currentRoom?.amount ?? order.serviceCharge));
+      final added = newServiceCharge - order.serviceCharge;
       final newTotal = (data?['grand_total'] as num?)?.toDouble() ??
           (order.grandTotal + added);
-      final units = table.roomCharge > 0
-          ? (newServiceCharge / table.roomCharge * 2).round() / 2
-          : null;
+      final units = (data?['room_hours'] as num?)?.toDouble() ?? sessions;
 
       SystemSound.play(SystemSoundType.alert);
       HapticFeedback.mediumImpact();
@@ -1064,9 +1058,43 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       SystemSound.play(SystemSoundType.alert);
       await showExtendRoomChargeError(
         context,
-        result['error']?.toString() ?? 'Failed to extend room charge',
+        result['error']?.toString() ?? 'Failed to update room charge',
       );
     }
+  }
+
+  /// Hourly room charge of [order]'s table (0 for regular tables).
+  double _roomRateForOrder(WaiterOrder order) {
+    if (order.roomCharge > 0) return order.roomCharge;
+    for (final t in _tables) {
+      if (t.id == order.tableId) return t.roomCharge;
+    }
+    return 0;
+  }
+
+  /// Order details: the room charge with its hours and, after a room
+  /// transfer, which room each part was made in.
+  Widget _roomChargeCard(WaiterOrder order, {required double fallbackRate}) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFD97706).withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: RoomCountdownBadge(order: order, fallbackRate: fallbackRate),
+          ),
+          RoomChargeHistory(order: order, fallbackRate: fallbackRate),
+        ],
+      ),
+    );
   }
 
   void _showTableOrderDetails(WaiterTable table) {
@@ -1082,11 +1110,12 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     } catch (e) {
       // No order found for this table
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('No order found for Table ${table.number}'),
-            backgroundColor: Colors.orange,
-          ),
+        showFloatingResult(
+          context,
+          title: 'No order found',
+          subtitle: 'No order found for Table ${table.number}',
+          warning: true,
+          duration: const Duration(milliseconds: 3200),
         );
       }
       return;
@@ -1105,11 +1134,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
       );
     }).toList();
     // Show order details in a view-only bottom sheet
-    showModalBottomSheet(
+    showBlurredBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -1283,6 +1311,8 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                           ],
                         ),
                       ),
+                    if (RoomChargeHistory.hasContent(order, fallbackRate: table.roomCharge))
+                      _roomChargeCard(order, fallbackRate: table.roomCharge),
                   ],
                 ),
               ),
@@ -1358,6 +1388,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                               currentTableName: displayTableName,
                               currentTableId: table.id,
                               allTables: _tables,
+                              order: order,
                             );
                             if (transferred == true && mounted) {
                               _loadData(showSpinner: false);
@@ -1451,11 +1482,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   // _showTableOrderDetails above, but built straight from a WaiterOrder
   // (Order List already has the order in hand; no table lookup needed).
   void _showOrderDetailsSheet(WaiterOrder order) {
-    showModalBottomSheet(
+    showBlurredBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -1467,7 +1497,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
         final rawTableName = (order.tableNumber ?? '').trim();
         final displayTableName = rawTableName.isEmpty
-            ? 'Order #${order.id}'
+            ? (order.isTakeOut ? order.takeOutLabel : 'Order #${order.id}')
             : (rawTableName.toLowerCase().startsWith('table') ? rawTableName : 'Table $rawTableName');
 
         final totalQuantity = order.items.fold<double>(0, (sum, item) => sum + item.quantity);
@@ -1635,6 +1665,8 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                           ],
                         ),
                       ),
+                    if (RoomChargeHistory.hasContent(order, fallbackRate: _roomRateForOrder(order)))
+                      _roomChargeCard(order, fallbackRate: _roomRateForOrder(order)),
                   ],
                 ),
               ),
@@ -1744,6 +1776,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                                   currentTableName: displayTableName,
                                   currentTableId: order.tableId,
                                   allTables: _tables,
+                                  order: order,
                                 );
                                 if (transferred == true && mounted) {
                                   _loadData(showSpinner: false);
@@ -1889,21 +1922,19 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
   }
 
   Future<MenuItem?> _showMenuPicker(BuildContext context) async {
-    return showModalBottomSheet<MenuItem>(
+    return showBlurredBottomSheet<MenuItem>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
       builder: (context) => MenuPickerSheet(menuItems: _menuItems),
     );
   }
 
   Future<bool?> _showConfirmOrderSheet(WaiterOrder order) async {
-    return showModalBottomSheet<bool>(
+    return showBlurredBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
       builder: (context) {
         return ConfirmOrderBottomSheet(
           title: 'Confirm order',
@@ -1930,11 +1961,10 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     WaiterOrder order,
     List<EditableOrderItem> editableItems,
   ) async {
-    return showModalBottomSheet<List<EditableOrderItem>>(
+    return showBlurredBottomSheet<List<EditableOrderItem>>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
       builder: (context) {
         return EditOrderBottomSheet(
           title: 'Edit Order',
@@ -1953,20 +1983,11 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
 
   @override
   Widget build(BuildContext context) {
+    TakeOutNumbers.refresh(_orders);
     if (_isLoading) {
       return Scaffold(
         backgroundColor: const Color(0xFFF5F6F0),
-        appBar: AppBar(
-          title: Text(
-            'WAITER DASHBOARD',
-            style: GoogleFonts.urbanist(
-              fontWeight: FontWeight.w900,
-              letterSpacing: 2,
-              fontSize: 18,
-              color: const Color(0xFF1A1C18),
-            ),
-          ),
-        ),
+        appBar: AppBar(),
         body: const Center(
           child: CircularProgressIndicator(
             valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF0C0E2B)),
@@ -1978,17 +1999,7 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
     if (_errorMessage != null) {
       return Scaffold(
         backgroundColor: const Color(0xFFF5F6F0),
-        appBar: AppBar(
-          title: Text(
-            'WAITER DASHBOARD',
-            style: GoogleFonts.urbanist(
-              fontWeight: FontWeight.w900,
-              letterSpacing: 2,
-              fontSize: 18,
-              color: const Color(0xFF1A1C18),
-            ),
-          ),
-        ),
+        appBar: AppBar(),
         body: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -2039,7 +2050,6 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
           final useSidebar = isLandscape && screenWidth >= 1500;
           final isMobile = !useSidebar;
           final controller = DefaultTabController.of(innerContext);
-          _tabController = controller;
 
           Future<void> logout() async {
             await ApiService.logout();
@@ -2156,6 +2166,18 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                         onEditOrder: _editOrderForTable,
                         onExtendRoomCharge: _extendRoomChargeForTable,
                         onCancelOrder: _cancelOrder,
+                        // A 2F-only account can't see the ground-floor take-out it would create.
+                        onNewTakeOut: _floorScope == '2f'
+                            ? null
+                            : () async {
+                                await openNewTakeOut(
+                                  context,
+                                  menuItems: _menuItems,
+                                  orders: _orders,
+                                );
+                                if (!mounted) return;
+                                await _loadData(showSpinner: false);
+                              },
                       ),
                       NewOrdersTab(
                         orders: newOrders,
@@ -2182,15 +2204,20 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                     backgroundColor: Colors.transparent,
                     elevation: 0,
                     scrolledUnderElevation: 0,
-                    title: Text(
-            'WAITER DASHBOARD',
-            style: GoogleFonts.urbanist(
-              fontWeight: FontWeight.w900,
-              letterSpacing: 2,
-              fontSize: 18,
-              color: const Color(0xFF1A1C18),
-            ),
-          ),
+                    centerTitle: true,
+                    toolbarHeight: 84,
+                    // BLUE MOON • WAITER • GROUND FLOOR (shrinks on narrow
+                    // phones instead of overflowing).
+                    title: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: QuickMenuBrand(
+                        tableLabel: _floorScope == 'gf'
+                            ? 'WAITER  •  GROUND FLOOR'
+                            : _floorScope == '2f'
+                                ? 'WAITER  •  2nd FLOOR'
+                                : 'WAITER',
+                      ),
+                    ),
                     actions: [
                       IconButton(
                         tooltip: 'Refresh',
@@ -2218,35 +2245,11 @@ class _WaiterHomePageState extends State<WaiterHomePage> with TickerProviderStat
                       ),
                     ],
                     bottom: PreferredSize(
-                      preferredSize: const Size.fromHeight(48),
-                      child: TabBar(
-                        labelColor: const Color(0xFF0C0E2B),
-                        unselectedLabelColor: Colors.black54,
-                        indicatorColor: const Color(0xFF0C0E2B),
-                        indicatorWeight: 3,
-                        indicatorSize: TabBarIndicatorSize.label,
-                        tabs: [
-                          const Tab(
-                            child: _TabBadgeItem(
-                              label: 'Tables',
-                              count: 0,
-                            ),
-                          ),
-                          Tab(
-                            child: _TabBadgeItem(
-                              label: 'New Orders',
-                              count: newOrdersCount,
-                              badgeColor: const Color(0xFFD32F2F),
-                            ),
-                          ),
-                          Tab(
-                            child: _TabBadgeItem(
-                              label: 'Order List',
-                              count: activeOrderCount,
-                              badgeColor: const Color(0xFF0C0E2B),
-                            ),
-                          ),
-                        ],
+                      preferredSize: const Size.fromHeight(68),
+                      child: _DashboardTabs(
+                        controller: controller,
+                        newOrdersCount: newOrdersCount,
+                        activeOrderCount: activeOrderCount,
                       ),
                     ),
                   )
@@ -2362,63 +2365,48 @@ class _TotalsRow extends StatelessWidget {
   }
 }
 
-class _TabBadgeItem extends StatelessWidget {
-  final String label;
-  final int count;
-  final Color? badgeColor;
-  final Color? textColor;
+/// Waiter Dashboard tabs: the shared sliding segmented control, driven by the
+/// page's TabController (so swiping between pages moves the pill too).
+class _DashboardTabs extends StatelessWidget {
+  final TabController controller;
+  final int newOrdersCount;
+  final int activeOrderCount;
 
-  const _TabBadgeItem({
-    required this.label,
-    required this.count,
-    this.badgeColor,
-    this.textColor,
+  const _DashboardTabs({
+    required this.controller,
+    required this.newOrdersCount,
+    required this.activeOrderCount,
   });
 
   @override
   Widget build(BuildContext context) {
-    final bg = badgeColor ?? const Color(0xFFD32F2F);
-    final fg = textColor ?? Colors.white;
-
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          label,
-          style: GoogleFonts.urbanist(
-            fontWeight: FontWeight.w700,
-            fontSize: 14.5,
-          ),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 4, 14, 8),
+      child: AnimatedBuilder(
+        animation: controller,
+        builder: (context, _) => SlidingSegments(
+          selectedIndex: controller.index,
+          position: controller.animation,
+          onChanged: controller.animateTo,
+          segments: [
+            const SegmentLabel(
+              label: 'Tables',
+              icon: Icons.table_restaurant_rounded,
+            ),
+            SegmentLabel(
+              label: 'New Orders',
+              icon: Icons.notifications_active_outlined,
+              count: newOrdersCount,
+              alert: true,
+            ),
+            SegmentLabel(
+              label: 'Order List',
+              icon: Icons.receipt_long_rounded,
+              count: activeOrderCount,
+            ),
+          ],
         ),
-        if (count > 0) ...[
-          const SizedBox(width: 6),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-            constraints: const BoxConstraints(minWidth: 18),
-            decoration: BoxDecoration(
-              color: bg,
-              borderRadius: BorderRadius.circular(10),
-              boxShadow: [
-                BoxShadow(
-                  color: bg.withValues(alpha: 0.35),
-                  blurRadius: 4,
-                  offset: const Offset(0, 1.5),
-                ),
-              ],
-            ),
-            child: Text(
-              count > 99 ? '99+' : '$count',
-              textAlign: TextAlign.center,
-              style: GoogleFonts.urbanist(
-                fontSize: 11,
-                fontWeight: FontWeight.w800,
-                color: fg,
-              ),
-            ),
-          ),
-        ],
-      ],
+      ),
     );
   }
 }

@@ -149,6 +149,52 @@
       }
     };
 
+    // Chime + speak `text` once (e.g. a room's "15 minutes left"). A running
+    // repeating order announcement is paused for it and picks up again after,
+    // unless it was stopped or replaced in the meantime.
+    window.speakOnceAnnouncement = function(text) {
+      try {
+        if (!window.speechSynthesis) {
+          if (window.playPosNotificationSound) window.playPosNotificationSound();
+          return;
+        }
+        const resumeText = _alertActive ? _activeSpeechText : null;
+        if (_alertTimeout) {
+          clearTimeout(_alertTimeout);
+          _alertTimeout = null;
+        }
+        _alertActive = false;
+        window.speechSynthesis.cancel();
+        if (window.playPosNotificationSound) window.playPosNotificationSound();
+
+        const resume = function() {
+          if (resumeText && !_alertActive && _activeSpeechText === resumeText) {
+            window.startRepeatingOrderAlert(resumeText);
+          }
+        };
+
+        setTimeout(() => {
+          try {
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 0.95;
+            utterance.pitch = 1.05;
+            utterance.lang = 'en-US';
+            const voices = window.speechSynthesis.getVoices();
+            const engVoice = voices.find(v => v.lang && v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Online') || v.name.includes('Samantha') || v.name.includes('Zira') || v.name.includes('David')));
+            if (engVoice) utterance.voice = engVoice;
+            utterance.onend = resume;
+            utterance.onerror = resume;
+            window.speechSynthesis.speak(utterance);
+          } catch (e) {
+            console.warn('Speech error:', e);
+            resume();
+          }
+        }, 320);
+      } catch (e) {
+        console.warn('Speech error:', e);
+      }
+    };
+
     window.startRepeatingOrderAlert = function(text, intervalMs) {
       window.stopOrderAlert();
       _alertActive = true;

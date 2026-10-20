@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../models.dart';
+import '../../shared/widgets/blurred_dialog.dart';
 
 /// Shows a sleek, compact bottom sheet or dialog to add/edit special kitchen instructions.
 Future<void> showItemNoteModal({
@@ -25,7 +26,7 @@ Future<void> showItemNoteModal({
     'Well Done',
   ];
 
-  await showModalBottomSheet<void>(
+  await showBlurredBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,

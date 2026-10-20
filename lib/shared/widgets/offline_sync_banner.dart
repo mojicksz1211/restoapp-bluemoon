@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../offline_sync_service.dart';
+import 'floating_result.dart';
 
 class OfflineSyncBanner extends StatelessWidget {
   const OfflineSyncBanner({super.key});
@@ -98,12 +99,10 @@ class OfflineSyncBanner extends StatelessWidget {
                           onTap: () async {
                             final ok = await OfflineSyncService.instance.probeReachability();
                             if (!ok && context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text('Cannot reach moonctgroup.com yet. Still offline.'),
-                                  duration: Duration(seconds: 2),
-                                  backgroundColor: Color(0xFFB91C1C),
-                                ),
+                              showFloatingError(
+                                context,
+                                title: 'Still offline',
+                                message: 'Cannot reach moonctgroup.com yet. Still offline.',
                               );
                             }
                           },

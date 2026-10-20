@@ -27,6 +27,11 @@ class WaiterCartStore extends ChangeNotifier {
   final Map<String, DateTime> _savedAt = {};
   bool _restored = false;
 
+  /// Room-charge sessions picked for a new order on a KTV room (default 1,
+  /// 0 = waived / 100% less, 0.5 steps like the admin's Manual Order). Kept in
+  /// memory only and cleared with the cart.
+  final Map<String, double> _roomChargeQty = {};
+
   /// A brand-new order for an available table is keyed by the table; an
   /// "additional order" against an existing order is keyed by that order, so
   /// the two never clobber each other.
@@ -63,7 +68,15 @@ class WaiterCartStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  double roomChargeQty(String key) => _roomChargeQty[key] ?? 1;
+
+  void setRoomChargeQty(String key, double qty) {
+    _roomChargeQty[key] = qty;
+    notifyListeners();
+  }
+
   void clear(String key) {
+    _roomChargeQty.remove(key);
     final removed = _carts.remove(key) != null;
     _savedAt.remove(key);
     if (removed) {

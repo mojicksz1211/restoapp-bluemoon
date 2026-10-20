@@ -1,30 +1,43 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../shared/widgets/blurred_dialog.dart';
 import '../models.dart';
+import '../waiter_models.dart' show formatRoomHours;
 
-// Shared palette — matches the waiter table cards (navy gradient + gold accent).
+// White card over a blurred, dimmed screen — same look as the app's other
+// popups (loading, results, cancel confirmation).
 const _navy = Color(0xFF0C0E2B);
 const _navyLight = Color(0xFF1B1E4A);
 const _gold = Color(0xFFE8C468);
+const _amber = Color(0xFFD97706);
+const _red = Color(0xFFDC2626);
+const _muted = Color(0xFF64748B);
 
-/// Confirmation shown before extending a room's charge. Lets the waiter pick
-/// a qty in 0.5 steps (same as admin's manual-order room charge stepper).
-/// Returns the confirmed qty, or `null` when cancelled.
-Future<double?> showExtendRoomChargeConfirm(
+/// Room charge adjuster for an open order: starts at the hours the room it's
+/// in now is billed for (1 session = 1 hour) and goes up or down in 0.5 steps
+/// — down to 0, the room charge waived (100% less) — same as the waiter's
+/// new-order cart and the admin's manual-order stepper. [currentRoomCharge]
+/// is that room's charge; [earlierRoomCharge] what rooms the order moved out
+/// of were billed (unchanged here). Returns the room's new total hours, or
+/// `null` when cancelled or unchanged.
+Future<double?> showRoomChargeAdjust(
   BuildContext context, {
   required String tableName,
   required String orderLabel,
   required double roomCharge,
   required double currentRoomCharge,
+  double earlierRoomCharge = 0,
 }) {
-  return showDialog<double>(
-    context: context,
+  return showBlurredDialog<double>(
+    context,
+    useRootNavigator: false,
     builder: (ctx) => _ExtendQtyDialog(
       tableName: tableName,
       orderLabel: orderLabel,
       roomCharge: roomCharge,
       currentRoomCharge: currentRoomCharge,
+      earlierRoomCharge: earlierRoomCharge,
     ),
   );
 }
@@ -36,12 +49,14 @@ class _ExtendQtyDialog extends StatefulWidget {
   final String orderLabel;
   final double roomCharge;
   final double currentRoomCharge;
+  final double earlierRoomCharge;
 
   const _ExtendQtyDialog({
     required this.tableName,
     required this.orderLabel,
     required this.roomCharge,
     required this.currentRoomCharge,
+    this.earlierRoomCharge = 0,
   });
 
   @override
@@ -49,44 +64,78 @@ class _ExtendQtyDialog extends StatefulWidget {
 }
 
 class _ExtendQtyDialogState extends State<_ExtendQtyDialog> {
-  double _qty = 0.5;
+  static const double _maxSessions = 20;
+
+  /// Hours the room is billed for now (its room charge ÷ the hourly rate).
+  late final double _current = widget.roomCharge > 0
+      ? (widget.currentRoomCharge / widget.roomCharge * 2).round() / 2
+      : 0;
+
+  /// The new total — starts at the current one; Update stays disabled until
+  /// it actually changes.
+  late double _qty = _current;
 
   @override
   Widget build(BuildContext context) {
-    final additional = widget.roomCharge * _qty;
+    final newCharge = widget.roomCharge * _qty;
+    final change = newCharge - widget.roomCharge * _current;
+    final String changeLabel;
+    if (change.abs() < 0.005) {
+      changeLabel = 'No change';
+    } else if (change > 0) {
+      changeLabel = '+ ₱${formatPrice(change)}';
+    } else {
+      changeLabel = '− ₱${formatPrice(-change)}';
+    }
     return _ExtendDialogShell(
       icon: Icons.more_time_rounded,
       showLogo: true,
-      title: 'Extend Room Charge',
+      title: 'Room Charge',
       accent: _gold,
       subtitle: '${widget.tableName} • ${widget.orderLabel}',
       body: Column(
         children: [
           _QtyStepper(
             qty: _qty,
-            onDecrement: _qty > 0.5 ? () => setState(() => _qty -= 0.5) : null,
-            onIncrement: () => setState(() => _qty += 0.5),
+            onDecrement: _qty > 0 ? () => setState(() => _qty = (_qty - 0.5).clamp(0, _maxSessions)) : null,
+            onIncrement: _qty < _maxSessions
+                ? () => setState(() => _qty = (_qty + 0.5).clamp(0, _maxSessions))
+                : null,
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 6),
+          Text(
+            '₱${formatPrice(widget.roomCharge)} per hour  •  0 = waived (100% less)',
+            textAlign: TextAlign.center,
+            style: GoogleFonts.urbanist(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+              color: _muted,
+            ),
+          ),
+          const SizedBox(height: 14),
           _BreakdownBox(
             rows: [
-              _BreakdownRow('Current room charge', '₱${formatPrice(widget.currentRoomCharge)}'),
+              if (widget.earlierRoomCharge > 0.005)
+                _BreakdownRow(
+                  'Earlier rooms',
+                  '₱${formatPrice(widget.earlierRoomCharge)}',
+                ),
               _BreakdownRow(
-                _qty == 1 ? 'Additional session' : 'Additional session (×${_fmtQty(_qty)})',
-                '+ ₱${formatPrice(additional)}',
-                accent: true,
+                'Current (${formatRoomHours(_current)})',
+                '₱${formatPrice(widget.currentRoomCharge)}',
               ),
+              _BreakdownRow('Change', changeLabel, accent: true),
               _BreakdownRow(
-                'Total Room Charge',
-                '₱${formatPrice(widget.currentRoomCharge + additional)}',
+                _qty == 0 ? 'New room charge (waived)' : 'New room charge (${formatRoomHours(_qty)})',
+                '₱${formatPrice(newCharge)}',
                 emphasize: true,
               ),
             ],
           ),
         ],
       ),
-      primaryLabel: 'Extend',
-      onPrimary: () => Navigator.of(context).pop(_qty),
+      primaryLabel: 'Update',
+      onPrimary: _qty != _current ? () => Navigator.of(context).pop(_qty) : null,
       secondaryLabel: 'Cancel',
       onSecondary: () => Navigator.of(context).pop(),
     );
@@ -96,7 +145,7 @@ class _ExtendQtyDialogState extends State<_ExtendQtyDialog> {
 class _QtyStepper extends StatelessWidget {
   final double qty;
   final VoidCallback? onDecrement;
-  final VoidCallback onIncrement;
+  final VoidCallback? onIncrement;
 
   const _QtyStepper({required this.qty, required this.onDecrement, required this.onIncrement});
 
@@ -106,11 +155,11 @@ class _QtyStepper extends StatelessWidget {
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
         Text(
-          'Qty',
+          'Hours',
           style: GoogleFonts.urbanist(
             fontSize: 13,
             fontWeight: FontWeight.w700,
-            color: Colors.white.withValues(alpha: 0.7),
+            color: _muted,
           ),
         ),
         const SizedBox(width: 16),
@@ -120,7 +169,7 @@ class _QtyStepper extends StatelessWidget {
           child: Text(
             _fmtQty(qty),
             textAlign: TextAlign.center,
-            style: GoogleFonts.urbanist(fontSize: 18, fontWeight: FontWeight.w900, color: Colors.white),
+            style: GoogleFonts.urbanist(fontSize: 18, fontWeight: FontWeight.w900, color: _navy),
           ),
         ),
         _StepperButton(icon: Icons.add_rounded, onTap: onIncrement),
@@ -129,6 +178,7 @@ class _QtyStepper extends StatelessWidget {
   }
 }
 
+/// Navy circle with a white icon — same as the cart sheet's steppers.
 class _StepperButton extends StatelessWidget {
   final IconData icon;
   final VoidCallback? onTap;
@@ -140,25 +190,26 @@ class _StepperButton extends StatelessWidget {
     final enabled = onTap != null;
     return Material(
       color: Colors.transparent,
+      shape: const CircleBorder(),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(10),
+        customBorder: const CircleBorder(),
         child: Container(
           width: 36,
           height: 36,
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(10),
-            color: _gold.withValues(alpha: enabled ? 0.16 : 0.06),
-            border: Border.all(color: _gold.withValues(alpha: enabled ? 0.5 : 0.15)),
+            shape: BoxShape.circle,
+            color: _navy.withValues(alpha: enabled ? 1 : 0.2),
           ),
-          child: Icon(icon, size: 18, color: _gold.withValues(alpha: enabled ? 1 : 0.3)),
+          child: Icon(icon, size: 20, color: Colors.white),
         ),
       ),
     );
   }
 }
 
-/// Success dialog after a room charge is extended.
+/// Success dialog after a room charge is changed. [added] is negative when
+/// it went down; a [newRoomCharge] of 0 means it was waived.
 Future<void> showRoomChargeExtendedResult(
   BuildContext context, {
   required String tableName,
@@ -167,21 +218,32 @@ Future<void> showRoomChargeExtendedResult(
   required double newGrandTotal,
   double? units,
 }) {
-  final unitsLabel = units != null && units % 1 == 0 ? units.toInt().toString() : units?.toStringAsFixed(1);
-  return showDialog<void>(
-    context: context,
+  final waived = newRoomCharge.abs() < 0.005;
+  final title = waived
+      ? 'Room Charge Waived'
+      : (added < 0 ? 'Room Charge Reduced' : 'Room Charge Extended');
+  return showBlurredDialog<void>(
+    context,
+    useRootNavigator: false,
     builder: (ctx) => _ExtendDialogShell(
       icon: Icons.check_rounded,
       showLogo: true,
-      title: 'Room Charge Extended',
+      title: title,
       accent: _gold,
-      subtitle: units != null && units > 1
-          ? '$tableName • now ×$unitsLabel sessions'
+      subtitle: !waived && units != null
+          ? '$tableName • now ${formatRoomHours(units)}'
           : tableName,
       body: _BreakdownBox(
         rows: [
-          _BreakdownRow('Added', '+ ₱${formatPrice(added)}', accent: true),
-          _BreakdownRow('Room charge total', '₱${formatPrice(newRoomCharge)}'),
+          _BreakdownRow(
+            'Change',
+            added < 0 ? '− ₱${formatPrice(-added)}' : '+ ₱${formatPrice(added)}',
+            accent: true,
+          ),
+          _BreakdownRow(
+            'Room charge total',
+            waived ? 'Waived (₱0.00)' : '₱${formatPrice(newRoomCharge)}',
+          ),
           _BreakdownRow('New order total', '₱${formatPrice(newGrandTotal)}', emphasize: true),
         ],
       ),
@@ -193,12 +255,13 @@ Future<void> showRoomChargeExtendedResult(
 
 /// Error dialog when extending fails.
 Future<void> showExtendRoomChargeError(BuildContext context, String message) {
-  return showDialog<void>(
-    context: context,
+  return showBlurredDialog<void>(
+    context,
+    useRootNavigator: false,
     builder: (ctx) => _ExtendDialogShell(
       icon: Icons.error_outline_rounded,
-      title: 'Extend Failed',
-      accent: const Color(0xFFEF6B6B),
+      title: 'Update Failed',
+      accent: _red,
       subtitle: message,
       primaryLabel: 'Close',
       onPrimary: () => Navigator.of(ctx).pop(),
@@ -214,7 +277,7 @@ class _ExtendDialogShell extends StatelessWidget {
   final Color accent;
   final Widget? body;
   final String primaryLabel;
-  final VoidCallback onPrimary;
+  final VoidCallback? onPrimary;
   final String? secondaryLabel;
   final VoidCallback? onSecondary;
 
@@ -238,6 +301,7 @@ class _ExtendDialogShell extends StatelessWidget {
     // the GPU shrinking the full 1024px asset down and smearing it.
     final dpr = MediaQuery.of(context).devicePixelRatio;
     final logoCachePx = (70 * (dpr <= 0 ? 1 : dpr)).ceil();
+    final enabled = onPrimary != null;
     return Dialog(
       backgroundColor: Colors.transparent,
       elevation: 0,
@@ -247,16 +311,11 @@ class _ExtendDialogShell extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.fromLTRB(24, 26, 24, 22),
           decoration: BoxDecoration(
+            color: Colors.white,
             borderRadius: BorderRadius.circular(24),
-            gradient: const LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [_navy, _navyLight],
-            ),
-            border: Border.all(color: _gold.withValues(alpha: 0.3), width: 1),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withValues(alpha: 0.4),
+                color: Colors.black.withValues(alpha: 0.25),
                 blurRadius: 40,
                 offset: const Offset(0, 18),
               ),
@@ -271,8 +330,8 @@ class _ExtendDialogShell extends StatelessWidget {
                 padding: showLogo ? const EdgeInsets.all(3) : EdgeInsets.zero,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: accent.withValues(alpha: 0.16),
-                  border: Border.all(color: accent.withValues(alpha: 0.5), width: 1.5),
+                  color: accent.withValues(alpha: 0.12),
+                  border: Border.all(color: accent.withValues(alpha: showLogo ? 0.9 : 0.4), width: 1.5),
                 ),
                 child: showLogo
                     ? ClipOval(
@@ -294,7 +353,7 @@ class _ExtendDialogShell extends StatelessWidget {
                 style: GoogleFonts.urbanist(
                   fontSize: 20,
                   fontWeight: FontWeight.w900,
-                  color: Colors.white,
+                  color: _navy,
                   letterSpacing: 0.2,
                 ),
               ),
@@ -304,8 +363,8 @@ class _ExtendDialogShell extends StatelessWidget {
                 textAlign: TextAlign.center,
                 style: GoogleFonts.urbanist(
                   fontSize: 13.5,
-                  fontWeight: FontWeight.w600,
-                  color: _gold.withValues(alpha: 0.9),
+                  fontWeight: FontWeight.w700,
+                  color: _muted,
                 ),
               ),
               if (body != null) ...[
@@ -320,8 +379,8 @@ class _ExtendDialogShell extends StatelessWidget {
                       child: OutlinedButton(
                         onPressed: onSecondary,
                         style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white,
-                          side: BorderSide(color: Colors.white.withValues(alpha: 0.3)),
+                          foregroundColor: _navy,
+                          side: const BorderSide(color: _navy, width: 1.5),
                           padding: const EdgeInsets.symmetric(vertical: 13),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                         ),
@@ -334,18 +393,28 @@ class _ExtendDialogShell extends StatelessWidget {
                     const SizedBox(width: 10),
                   ],
                   Expanded(
-                    child: ElevatedButton(
-                      onPressed: onPrimary,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: _gold,
-                        foregroundColor: _navy,
-                        elevation: 0,
-                        padding: const EdgeInsets.symmetric(vertical: 13),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(12),
+                        gradient: enabled ? const LinearGradient(colors: [_navy, _navyLight]) : null,
+                        color: enabled ? null : const Color(0xFFE2E8F0),
                       ),
-                      child: Text(
-                        primaryLabel,
-                        style: GoogleFonts.urbanist(fontWeight: FontWeight.w900, fontSize: 14),
+                      child: ElevatedButton(
+                        onPressed: onPrimary,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.transparent,
+                          foregroundColor: Colors.white,
+                          disabledBackgroundColor: Colors.transparent,
+                          disabledForegroundColor: _muted,
+                          shadowColor: Colors.transparent,
+                          elevation: 0,
+                          padding: const EdgeInsets.symmetric(vertical: 13),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        child: Text(
+                          primaryLabel,
+                          style: GoogleFonts.urbanist(fontWeight: FontWeight.w900, fontSize: 14),
+                        ),
                       ),
                     ),
                   ),
@@ -377,17 +446,17 @@ class _BreakdownBox extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.06),
+        color: const Color(0xFFF8FAFC),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _gold.withValues(alpha: 0.18)),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
       child: Column(
         children: [
           for (int i = 0; i < rows.length; i++) ...[
             if (i > 0)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: Divider(height: 1, color: Colors.white.withValues(alpha: 0.08)),
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Divider(height: 1, color: Color(0xFFE2E8F0)),
               ),
             Row(
               children: [
@@ -397,7 +466,7 @@ class _BreakdownBox extends StatelessWidget {
                     style: GoogleFonts.urbanist(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
-                      color: Colors.white.withValues(alpha: 0.7),
+                      color: _muted,
                     ),
                   ),
                 ),
@@ -407,9 +476,7 @@ class _BreakdownBox extends StatelessWidget {
                   style: GoogleFonts.urbanist(
                     fontSize: rows[i].emphasize ? 16 : 13.5,
                     fontWeight: rows[i].emphasize ? FontWeight.w900 : FontWeight.w800,
-                    color: rows[i].accent
-                        ? _gold
-                        : (rows[i].emphasize ? Colors.white : Colors.white.withValues(alpha: 0.92)),
+                    color: rows[i].accent ? _amber : _navy,
                   ),
                 ),
               ],

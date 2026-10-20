@@ -7,7 +7,9 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../waiterApp/services/socket_service.dart';
 import '../waiterApp/services/api_service.dart';
+import '../waiterApp/services/room_time_alerts.dart';
 import '../waiterApp/waiter_models.dart';
+import 'floor_utils.dart';
 import 'lan_broadcast_service.dart';
 import 'offline_sync_service.dart';
 
@@ -253,6 +255,9 @@ bool _isUiForeground = false;
 Future<void> _showBackgroundOrderNotification({
   required String orderNo,
   String? tableNumber,
+  String title = 'New Order Received!',
+  String? detail,
+  int? id,
 }) async {
   if (_isUiForeground) {
     debugPrint('[BG SERVICE] UI is foreground — skipping banner (in-app alert already covers it).');
@@ -278,9 +283,12 @@ Future<void> _showBackgroundOrderNotification({
     sound: UriAndroidNotificationSound('content://settings/system/ringtone'),
   );
   await _backgroundNotifications.show(
-    id: orderNo.hashCode,
-    title: 'New Order Received!',
-    body: tableNumber != null ? '$orderNo • Table $tableNumber' : orderNo,
+    id: id ?? orderNo.hashCode,
+    title: title,
+    body: [
+      tableNumber != null ? '$orderNo • Table $tableNumber' : orderNo,
+      if (detail != null && detail.isNotEmpty) detail,
+    ].join(' — '),
     notificationDetails: NotificationDetails(android: androidDetails),
     payload: orderNo,
   );
@@ -313,6 +321,9 @@ Future<void> _runService(ServiceInstance service) async {
   final role = (prefs.getString('role') ?? '').toLowerCase();
   final permissionId = int.tryParse(prefs.getString('permissions') ?? '');
   final userId = prefs.getString('user_id');
+  // 'gf' / '2f' for a floor-scoped account (room-time warnings only cover
+  // that floor's rooms), null for an unscoped one.
+  final floorScope = normalizeFloor(prefs.getString('floor'));
 
   final isCashier = permissionId == 15 || role.contains('cashier');
   final isWaiter = permissionId == 14 || role.contains('waiter');
@@ -390,6 +401,13 @@ Future<void> _runService(ServiceInstance service) async {
     final orderData = orderPayload(data);
     final orderId = orderIdOf(orderData);
     if (orderId == null) return;
+    // Orders that arrive already settled (Loyverse receipt imports, the
+    // admin's Manual Order / Upload Receipt — often for a past day) are
+    // history: no wake alert. The POLL payload carries no status, so it's
+    // unaffected (that poll only lists active orders anyway).
+    final status = int.tryParse(
+        (orderData['status'] ?? orderData['STATUS'] ?? data['status'] ?? '').toString());
+    if (status != null && status != 2 && status != 3) return;
     // The foreground UI does this for every LAN-received order so its own
     // offline order list (and this same handoff, once the app reopens) can
     // see it — the background isolate never did, so a purely offline/LAN
@@ -425,10 +443,20 @@ Future<void> _runService(ServiceInstance service) async {
   // waiterApp never alerts on items-added (only a brand-new pending order) —
   // mirrored here so the background isolate matches the foreground behavior
   // exactly. Only cashierApp registers this listener below.
+  /// `change` on a socket event (newer backend): {type, by, by_name, …}.
+  Map<String, dynamic>? changeOf(Map<String, dynamic> data, Map<String, dynamic> orderData) {
+    final raw = orderData['change'] ?? data['change'];
+    return raw is Map ? Map<String, dynamic>.from(raw) : null;
+  }
+
+  bool isOwnChange(Map<String, dynamic>? change) =>
+      change != null && userId != null && change['by']?.toString() == userId;
+
   void handleItemsAdded(Map<String, dynamic> data, String source) {
     final orderData = orderPayload(data);
     final orderId = orderIdOf(orderData);
     if (orderId == null) return;
+    if (isOwnChange(changeOf(data, orderData))) return; // this cashier added them
     if (source != 'POLL') {
       unawaited(OfflineSyncService.instance.upsertCachedOrder(orderData));
     }
@@ -445,7 +473,57 @@ Future<void> _runService(ServiceInstance service) async {
     }
   }
 
+  // Edited / cancelled / room charge changed by someone else → a plain
+  // notification (no wake-to-popup handoff: that one is for new orders).
+  final lastChangeAt = <int, String>{};
+  void handleOrderChanged(Map<String, dynamic> data) {
+    if (!isCashier) return;
+    final orderData = orderPayload(data);
+    final orderId = orderIdOf(orderData);
+    if (orderId == null) return;
+    final change = changeOf(data, orderData);
+    if (change == null || isOwnChange(change)) return;
+    final type = change['type']?.toString();
+    final at = change['at']?.toString() ?? '';
+    if (lastChangeAt[orderId] == '$type@$at') return; // same event delivered twice
+    lastChangeAt[orderId] = '$type@$at';
+    final by = change['by_name']?.toString();
+    var byText = by == null || by.isEmpty ? '' : 'by $by';
+    final String title;
+    switch (type) {
+      case 'transferred':
+        title = 'Table Transferred';
+        final to = change['to_table']?.toString();
+        if (to != null && to.isNotEmpty) byText = 'to $to${byText.isEmpty ? '' : ' $byText'}';
+        break;
+      case 'items_edited':
+        title = 'Order Edited';
+        break;
+      case 'cancelled':
+        title = 'Order Cancelled';
+        break;
+      case 'room_charge':
+        final to = (change['to'] as num?)?.toDouble();
+        title = to != null && to <= 0.005 ? 'Room Charge Waived' : 'Room Charge Updated';
+        break;
+      default:
+        return;
+    }
+    debugPrint('[BG-SOCKET] order $type — notifying for order $orderId');
+    final orderNo = (orderData['order_no'] ?? 'Order #$orderId').toString();
+    final tableNumber = orderData['table_number']?.toString();
+    if (!_isUiForeground) {
+      _showBackgroundOrderNotification(
+        orderNo: orderNo,
+        tableNumber: tableNumber,
+        title: title,
+        detail: byText,
+      );
+    }
+  }
+
   if (isCashier) {
+    SocketService.addOrderUpdateListener(handleOrderChanged);
     SocketService.addOrderCreatedListener((data) => handleOrderCreated(data, 'SOCKET'));
     SocketService.addOrderItemsAddedListener((data) => handleItemsAdded(data, 'SOCKET'));
     // LAN-broadcast alerts are cashier-only, matching cashierApp's
@@ -465,15 +543,69 @@ Future<void> _runService(ServiceInstance service) async {
   // skipped here (the REST order list has no reliable raw encoded_by field
   // to compare against, only a display name) — same tradeoff the existing
   // foreground poll fallback already accepts.
+  // Same floor rule as the home pages: the order's own floor wins, else
+  // "Room 1"-"Room 13" are 2nd floor and everything else ground floor.
+  bool visibleForFloor(WaiterOrder order) {
+    if (floorScope == null) return true;
+    final orderFloor = normalizeFloor(order.floor);
+    if (orderFloor != null) return orderFloor == floorScope;
+    final name = (order.tableNumber ?? '').toUpperCase().trim();
+    if (name.isEmpty) return true;
+    final room = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(name);
+    final roomNum = int.tryParse(room?.group(1) ?? '');
+    final isSecondFloor = roomNum != null && roomNum >= 1 && roomNum <= 13;
+    return floorScope == kFloorSecond ? isSecondFloor : !isSecondFloor;
+  }
+
+  // "15 minutes left" / "time is up" for rooms with a room charge — waiter and
+  // cashier both. Only while the app isn't on screen (it shows its own popup
+  // then); the app still pops up its own warning once it's opened.
+  Future<void> checkRoomTimes(List<WaiterOrder> orders) async {
+    if (_isUiForeground) return;
+    for (final order in orders) {
+      if (!visibleForFloor(order)) continue;
+      final c = RoomCountdown.of(order);
+      if (c == null || !c.shouldWarn) continue;
+      if (!await RoomTimeAlertLog.claim(c.alertKey, background: true)) continue;
+      debugPrint('[BG-ROOM] ${c.roomName} — ${c.label}');
+      await _showBackgroundOrderNotification(
+        id: c.alertKey.hashCode,
+        orderNo: order.orderNo ?? 'Order #${order.id}',
+        title: c.isOver ? 'Room Time Is Up — ${c.roomName}' : 'Room Time Ending Soon — ${c.roomName}',
+        detail: '${c.label} (ends ${formatClock(c.endsAt)}). Ask the guest if they want to extend.',
+      );
+    }
+  }
+
   bool hasPolledOnce = false;
+  // Last polled status per order, to spot an open order that got cancelled
+  // while the socket was down (cashier only, like the other change alerts).
+  final lastPolledStatus = <int, int>{};
   Future<void> pollForOrders() async {
     try {
       final result = await ApiService.getWaiterOrders();
       if (result['success'] != true) return;
       final ordersData = List<Map<String, dynamic>>.from(result['data'] ?? []);
-      for (final orderJson in ordersData) {
-        final order = WaiterOrder.fromApi(orderJson);
-        if (order.status != 2 && order.status != 3) continue;
+      final allOrders = ordersData.map(WaiterOrder.fromApi).toList();
+      final activeOrders = allOrders.where((o) => o.status == 2 || o.status == 3).toList();
+      unawaited(checkRoomTimes(activeOrders));
+      for (final order in allOrders) {
+        final before = lastPolledStatus[order.id];
+        lastPolledStatus[order.id] = order.status;
+        if (!isCashier || !hasPolledOnce || order.status != -1) continue;
+        if (before != 2 && before != 3) continue;
+        if (!visibleForFloor(order)) continue;
+        // Same notification id as the socket path's, so a cancel both of them
+        // caught shows once.
+        if (!_isUiForeground) {
+          unawaited(_showBackgroundOrderNotification(
+            orderNo: order.orderNo ?? 'Order #${order.id}',
+            tableNumber: order.tableNumber,
+            title: 'Order Cancelled',
+          ));
+        }
+      }
+      for (final order in activeOrders) {
         final wasKnown = alertedOrderIds.contains(order.id);
         if (!hasPolledOnce) {
           alertedOrderIds.add(order.id);

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../models.dart';
 import '../waiter_models.dart';
+import '../../shared/widgets/floating_result.dart';
 
 class EditOrderBottomSheet extends StatefulWidget {
   final String title;
@@ -49,13 +50,17 @@ class _EditOrderBottomSheetState extends State<EditOrderBottomSheet> {
     final screenWidth = MediaQuery.of(context).size.width;
     final isMobile = screenWidth < 600;
 
-    return DraggableScrollableSheet(
-      initialChildSize: isMobile ? 0.8 : 0.75,
-      minChildSize: isMobile ? 0.6 : 0.55,
-      maxChildSize: 0.95,
-      expand: false,
-      builder: (context, scrollController) {
+    // The sheet is only as tall as its content (one or two items = a short
+    // sheet) and caps at 92% of the screen, scrolling the item list beyond
+    // that. It used to be a fixed 75-80% tall sheet with a big empty gap.
+    return ConstrainedBox(
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.of(context).size.height * 0.92,
+      ),
+      child: Builder(
+        builder: (context) {
         return Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
             Container(
               padding: EdgeInsets.all(isMobile ? 16 : 20),
@@ -103,11 +108,11 @@ class _EditOrderBottomSheetState extends State<EditOrderBottomSheet> {
                 ],
               ),
             ),
-            Expanded(
+            Flexible(
               child: Container(
                 color: const Color(0xFFF5F6F0),
                 child: ListView.separated(
-                  controller: scrollController,
+                  shrinkWrap: true,
                   padding: EdgeInsets.all(isMobile ? 12 : 16),
                   itemCount: _items.length,
                   separatorBuilder: (_, __) => const SizedBox(height: 12),
@@ -282,11 +287,10 @@ class _EditOrderBottomSheetState extends State<EditOrderBottomSheet> {
                             final hasMissingMenu =
                                 _items.any((item) => item.menuId == null);
                             if (hasMissingMenu) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text('Please select a menu for all items.'),
-                                  backgroundColor: Colors.red,
-                                ),
+                              showFloatingError(
+                                context,
+                                title: 'Cannot save order',
+                                message: 'Please select a menu for all items.',
                               );
                               return;
                             }
@@ -322,7 +326,8 @@ class _EditOrderBottomSheetState extends State<EditOrderBottomSheet> {
             ),
           ],
         );
-      },
+        },
+      ),
     );
   }
 

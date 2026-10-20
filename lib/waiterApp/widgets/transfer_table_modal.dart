@@ -1,9 +1,12 @@
+import '../../shared/widgets/loading_overlay.dart';
+import '../../shared/widgets/floating_result.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../models.dart' show formatPrice;
 import '../waiter_models.dart';
 import '../services/api_service.dart';
-import 'center_popup.dart';
+import '../../shared/widgets/blurred_dialog.dart';
 
 Future<bool?> showTransferTableModal({
   required BuildContext context,
@@ -11,8 +14,11 @@ Future<bool?> showTransferTableModal({
   required String currentTableName,
   int? currentTableId,
   required List<WaiterTable> allTables,
+  // The order being moved — lets the sheet work out the room charge when a
+  // room is involved (time spent in the current room, its rate).
+  WaiterOrder? order,
 }) async {
-  return showModalBottomSheet<bool>(
+  return showBlurredBottomSheet<bool>(
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
@@ -22,6 +28,7 @@ Future<bool?> showTransferTableModal({
         currentTableName: currentTableName,
         currentTableId: currentTableId,
         allTables: allTables,
+        order: order,
       );
     },
   );
@@ -32,12 +39,14 @@ class _TransferTableSheet extends StatefulWidget {
   final String currentTableName;
   final int? currentTableId;
   final List<WaiterTable> allTables;
+  final WaiterOrder? order;
 
   const _TransferTableSheet({
     required this.orderId,
     required this.currentTableName,
     this.currentTableId,
     required this.allTables,
+    this.order,
   });
 
   @override
@@ -51,6 +60,115 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
 
   static const _navy = Color(0xFF0C0E2B);
   static const _gold = Color(0xFFE8C468);
+  static const _amber = Color(0xFFD97706);
+  static const double _maxHours = 20;
+
+  // Room charge on a move that involves a room: the room being left is billed
+  // for the time spent there (whole half-hours — 37 min → 30 mins) and the new
+  // room starts a fresh session (1 hr). Room-to-room before 30 minutes, the
+  // time carries over instead: the old room is billed nothing and the new room
+  // continues the same clock and booked hours at its own rate. Set when a
+  // table is picked ([_resetRoomHours]); both adjustable before confirming.
+  double _prevHours = 0;
+  double _newHours = 1;
+
+  WaiterTable? _tableById(int? id) {
+    if (id == null) return null;
+    for (final t in widget.allTables) {
+      if (t.id == id) return t;
+    }
+    return null;
+  }
+
+  WaiterTable? get _targetTable => _tableById(_selectedTargetTableId);
+
+  RoomChargeSegment? get _currentRoom => widget.order?.currentRoomCharge;
+
+  double get _sourceRate {
+    final active = _currentRoom;
+    if (active != null) return active.rate;
+    final order = widget.order;
+    if (order != null && order.roomCharges.isNotEmpty) return 0; // already moved out of its last room
+    return _tableById(widget.currentTableId)?.roomCharge ?? order?.roomCharge ?? 0;
+  }
+
+  double get _targetRate => _targetTable?.roomCharge ?? 0;
+
+  bool get _isOpenOrder {
+    final status = widget.order?.status;
+    return status == null || status == 2 || status == 3;
+  }
+
+  bool get _showRoomCharge =>
+      widget.order != null &&
+      _isOpenOrder &&
+      _selectedTargetTableId != null &&
+      (_sourceRate > 0 || _targetRate > 0);
+
+  /// Minutes the order has been in its current room.
+  int get _minutesInRoom {
+    final active = _currentRoom;
+    if (active != null && active.startedAt != null) return active.liveMinutesUsed;
+    final order = widget.order;
+    if (order == null) return 0;
+    final m = manilaNow().difference(order.gmt8DateTime).inMinutes;
+    return m < 0 ? 0 : m;
+  }
+
+  /// Hours the current room is billed for now.
+  double get _bookedHours {
+    final active = _currentRoom;
+    if (active != null) return active.hours;
+    final order = widget.order;
+    final rate = _sourceRate;
+    if (order == null || rate <= 0) return 0;
+    return (order.serviceCharge / rate * 2).round() / 2;
+  }
+
+  /// Room-to-room before 30 minutes: the time carries over to the new room.
+  bool get _carryOver =>
+      _sourceRate > 0 && _targetRate > 0 && _minutesInRoom < kRoomCarryOverMinutes;
+
+  /// When the order's clock in its current room started (Manila time).
+  DateTime? get _roomStartedAt => _currentRoom?.startedAt ?? widget.order?.gmt8DateTime;
+
+  void _resetRoomHours() {
+    if (_carryOver) {
+      _prevHours = 0;
+      _newHours = _bookedHours > 0 ? _bookedHours : 1;
+    } else {
+      _prevHours = _defaultPrevHours;
+      _newHours = 1;
+    }
+  }
+
+  double get _defaultPrevHours {
+    if (_sourceRate <= 0) return 0;
+    // A waived room (0 hrs) stays waived unless staff change it.
+    if (_bookedHours <= 0) return 0;
+    return billableRoomHours(_minutesInRoom);
+  }
+
+  /// Room charge after the move, for the preview.
+  double get _roomChargeAfter {
+    final order = widget.order;
+    if (order == null) return 0;
+    final earlier = order.roomCharges
+        .where((s) => !s.isActive)
+        .fold<double>(0, (sum, s) => sum + s.amount);
+    final double other;
+    if (order.roomCharges.isNotEmpty) {
+      other = order.otherServiceCharge;
+    } else if (_sourceRate > 0) {
+      other = (order.serviceCharge - _bookedHours * _sourceRate).clamp(0.0, double.infinity).toDouble();
+    } else {
+      other = order.serviceCharge;
+    }
+    return earlier +
+        _prevHours * _sourceRate +
+        (_targetRate > 0 ? _newHours * _targetRate : 0) +
+        other;
+  }
 
   List<WaiterTable> get _availableTables {
     // Only available tables (status == 1) and not the current table
@@ -91,50 +209,50 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
     setState(() => _isTransferring = true);
 
     try {
-      final result = await ApiService.transferTableOrder(
-        orderId: widget.orderId,
-        targetTableId: _selectedTargetTableId!,
+      final result = await runWithLoader<Map<String, dynamic>>(
+        context,
+        message: 'Transferring table…',
+        task: () => ApiService.transferTableOrder(
+          orderId: widget.orderId,
+          targetTableId: _selectedTargetTableId!,
+          prevRoomHours: _showRoomCharge && _sourceRate > 0 ? _prevHours : null,
+          newRoomHours: _showRoomCharge && _targetRate > 0 ? _newHours : null,
+          carryOverTime: _showRoomCharge && _sourceRate > 0 && _targetRate > 0 ? _carryOver : null,
+        ),
       );
 
       if (!mounted) return;
       setState(() => _isTransferring = false);
 
       if (result['unauthorized'] == true) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Session expired. Please login again.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Session expired',
+          message: 'Please login again.',
         );
         return;
       }
 
       if (result['success'] == true) {
-        Navigator.pop(context, true);
-        showCenterPopup(
+        // Insert into the root overlay first (it outlives this sheet), then
+        // close the sheet.
+        showFloatingResult(
           context,
-          icon: Icons.check_circle_rounded,
-          accentColor: Colors.green,
-          title: 'Table Transferred!',
-          subtitle: result['message'] ?? 'Order successfully moved to new table.',
+          title: 'Table Transferred',
+          subtitle: (result['message'] ?? 'Order moved to the new table.').toString(),
         );
+        Navigator.pop(context, true);
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(result['error'] ?? 'Failed to transfer table'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Transfer failed',
+          message: (result['error'] ?? 'Failed to transfer table').toString(),
         );
       }
     } catch (e) {
       if (!mounted) return;
       setState(() => _isTransferring = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error transferring table: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
+      showFloatingError(context, title: 'Transfer failed', message: e.toString());
     }
   }
 
@@ -288,7 +406,10 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
                           child: InkWell(
                             onTap: () {
                               setState(() {
-                                _selectedTargetTableId = table.id;
+                                if (_selectedTargetTableId != table.id) {
+                                  _selectedTargetTableId = table.id;
+                                  _resetRoomHours();
+                                }
                               });
                             },
                             borderRadius: BorderRadius.circular(12),
@@ -339,7 +460,17 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
                                             color: isSelected ? Colors.white : _navy,
                                           ),
                                         ),
-                                        if (table.capacity > 0) ...[
+                                        if (table.hasRoomCharge) ...[
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            '₱${formatPrice(table.roomCharge)}/hr',
+                                            style: GoogleFonts.urbanist(
+                                              fontSize: 10.5,
+                                              fontWeight: FontWeight.w800,
+                                              color: isSelected ? _gold : _amber,
+                                            ),
+                                          ),
+                                        ] else if (table.capacity > 0) ...[
                                           const SizedBox(height: 3),
                                           Text(
                                             '${table.capacity} seats',
@@ -373,6 +504,7 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
                       },
                     ),
             ),
+            if (_showRoomCharge) _buildRoomChargePanel(isMobile),
             // Bottom Action Bar
             Container(
               padding: EdgeInsets.fromLTRB(
@@ -468,6 +600,170 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildRoomChargePanel(bool isMobile) {
+    final targetName = (_targetTable?.number ?? '').trim();
+    final sourceName = widget.currentTableName.trim();
+    final before = widget.order?.serviceCharge ?? 0;
+    final after = _roomChargeAfter;
+    return Container(
+      width: double.infinity,
+      margin: EdgeInsets.fromLTRB(isMobile ? 14 : 20, 0, isMobile ? 14 : 20, 12),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _amber.withValues(alpha: 0.35)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.more_time_rounded, size: 16, color: _amber),
+              const SizedBox(width: 6),
+              Text(
+                'ROOM CHARGE',
+                style: GoogleFonts.urbanist(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w900,
+                  color: _amber,
+                  letterSpacing: 1.1,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                (after - before).abs() < 0.005
+                    ? '₱${formatPrice(after)}'
+                    : '₱${formatPrice(before)} → ₱${formatPrice(after)}',
+                style: GoogleFonts.urbanist(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w900,
+                  color: _navy,
+                ),
+              ),
+            ],
+          ),
+          if (_sourceRate > 0) ...[
+            const SizedBox(height: 8),
+            _roomHoursRow(
+              title: sourceName.isEmpty ? 'Current room' : sourceName,
+              subtitle: _carryOver
+                  ? 'In room ${formatMinutesUsed(_minutesInRoom)} · under $kRoomCarryOverMinutes mins, time continues in ${targetName.isEmpty ? 'the new room' : targetName}'
+                  : 'In room ${formatMinutesUsed(_minutesInRoom)} · billed for time used · ₱${formatPrice(_sourceRate)}/hr',
+              hours: _prevHours,
+              rate: _sourceRate,
+              onChanged: (v) => setState(() => _prevHours = v),
+            ),
+          ],
+          if (_targetRate > 0) ...[
+            const SizedBox(height: 8),
+            _roomHoursRow(
+              title: targetName.isEmpty ? 'New room' : targetName,
+              subtitle: _carryOver && _roomStartedAt != null
+                  ? 'Continues from ${formatClock(_roomStartedAt!)} · ₱${formatPrice(_targetRate)}/hr'
+                  : 'New session · ₱${formatPrice(_targetRate)}/hr',
+              hours: _newHours,
+              rate: _targetRate,
+              onChanged: (v) => setState(() => _newHours = v),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _roomHoursRow({
+    required String title,
+    required String subtitle,
+    required double hours,
+    required double rate,
+    required ValueChanged<double> onChanged,
+  }) {
+    Widget stepButton(IconData icon, VoidCallback? onTap) {
+      final enabled = onTap != null;
+      return InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          width: 30,
+          height: 30,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            color: Colors.white,
+            border: Border.all(
+              color: enabled ? _amber.withValues(alpha: 0.5) : Colors.grey.shade300,
+            ),
+          ),
+          child: Icon(icon, size: 16, color: enabled ? _amber : Colors.grey.shade400),
+        ),
+      );
+    }
+
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: GoogleFonts.urbanist(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w800,
+                  color: _navy,
+                ),
+              ),
+              Text(
+                subtitle,
+                style: GoogleFonts.urbanist(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey.shade600,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 8),
+        stepButton(
+          Icons.remove_rounded,
+          hours > 0 ? () => onChanged((hours - 0.5).clamp(0, _maxHours).toDouble()) : null,
+        ),
+        SizedBox(
+          width: 62,
+          child: Text(
+            hours <= 0 ? 'Waived' : formatRoomHours(hours),
+            textAlign: TextAlign.center,
+            style: GoogleFonts.urbanist(
+              fontSize: 13,
+              fontWeight: FontWeight.w900,
+              color: _navy,
+            ),
+          ),
+        ),
+        stepButton(
+          Icons.add_rounded,
+          hours < _maxHours ? () => onChanged((hours + 0.5).clamp(0, _maxHours).toDouble()) : null,
+        ),
+        SizedBox(
+          width: 78,
+          child: Text(
+            '₱${formatPrice(rate * hours)}',
+            textAlign: TextAlign.right,
+            style: GoogleFonts.urbanist(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w800,
+              color: _amber,
+            ),
+          ),
+        ),
+      ],
     );
   }
 

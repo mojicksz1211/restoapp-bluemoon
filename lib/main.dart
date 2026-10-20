@@ -13,6 +13,7 @@ import 'shared/globals.dart';
 import 'shared/offline_sync_service.dart';
 import 'shared/lan_broadcast_service.dart';
 import 'shared/background_service.dart';
+import 'shared/session_presence.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -103,6 +104,12 @@ class RootAppState extends State<RootApp> {
         _role = role;
         _isLoading = false;
       });
+    }
+    // Keeps this account hidden from other tablets' login picker.
+    if (isLoggedIn) {
+      SessionPresence.start();
+    } else {
+      SessionPresence.stop();
     }
   }
 
@@ -238,5 +245,6 @@ class RootAppState extends State<RootApp> {
       _permissionId = pId;
       _role = role;
     });
+    SessionPresence.start();
   }
 }

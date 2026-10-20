@@ -14,22 +14,34 @@ import '../widgets/confirm_order_bottom_sheet.dart';
 import '../widgets/get_order_menu_card.dart';
 import '../widgets/get_order_sidebar.dart';
 import '../widgets/get_order_cart_panel.dart';
-import '../widgets/center_popup.dart';
 import '../widgets/item_note_modal.dart';
 import '../widgets/quick_add_drinks_carousel.dart';
 import '../widgets/fire_glow_background.dart';
+import 'quick_menu_page.dart';
 import '../../shared/widgets/offline_sync_banner.dart';
+import '../../shared/widgets/loading_overlay.dart';
+import '../../shared/widgets/floating_result.dart';
+import '../../shared/widgets/blurred_dialog.dart';
 
 class GetOrderPage extends StatefulWidget {
   final WaiterTable table;
   final List<MenuItem> menuItems;
   final WaiterOrder? existingOrder;
 
+  /// Opens straight into the Switch Menu (board-style ordering screen). The
+  /// classic grid layout below stays reachable from the Switch Menu header.
+  final bool startInSwitchMenu;
+
+  /// 'DINE_IN' (default) or 'TAKE_OUT'.
+  final String? initialOrderType;
+
   const GetOrderPage({
     super.key,
     required this.table,
     required this.menuItems,
     this.existingOrder,
+    this.startInSwitchMenu = true,
+    this.initialOrderType,
   });
 
   @override
@@ -54,6 +66,10 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
   String? _selectedOrderType;
   int _displayLimit = 18; // Initial limit for "All" filter
   bool _isCartPanelOpen = false;
+
+  // True while the Switch Menu is this page's "face": the classic layout is
+  // hidden behind a blank scaffold so it never flashes before Switch Menu opens.
+  late bool _switchMode;
 
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
@@ -101,7 +117,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
       _topRevenueItems = _resolveTopRevenueItems(cachedRaw);
     }
     _categories = _buildCategories();
-    _selectedOrderType = 'DINE_IN';
+    _selectedOrderType = widget.initialOrderType ?? 'DINE_IN';
 
     _flyController = AnimationController(
       vsync: this,
@@ -119,6 +135,13 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
     );
 
     _loadTopRevenueItems();
+
+    _switchMode = widget.startInSwitchMenu;
+    if (_switchMode) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _openQuickMenu();
+      });
+    }
   }
 
   List<MenuItem> _resolveTopRevenueItems(List<dynamic> rawList) {
@@ -189,6 +212,40 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
     _searchController.dispose();
     _categoryStripController.dispose();
     super.dispose();
+  }
+
+  /// Opens the Switch Menu (board-style +/- ordering screen). It has its own
+  /// cart and places the order itself; both screens share the cart through
+  /// WaiterCartStore, so on return we reload it.
+  ///   - 'classic' -> show this page's classic layout.
+  ///   - 'placed'  -> order was placed, leave the ordering flow.
+  ///   - back      -> leave the ordering flow (back to the dashboard).
+  Future<void> _openQuickMenu() async {
+    _switchMode = true;
+    _persistCart();
+    final result = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => QuickMenuPage(
+          table: widget.table,
+          menuItems: widget.menuItems,
+          existingOrder: widget.existingOrder,
+          cartKey: _cartKey,
+          salesQtyOf: _getItemSalesQty,
+          initialOrderType: _selectedOrderType,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    setState(() {
+      _cart
+        ..clear()
+        ..addAll(WaiterCartStore.instance.load(_cartKey));
+    });
+    if (result == 'classic') {
+      setState(() => _switchMode = false);
+      return;
+    }
+    Navigator.of(context).pop();
   }
 
   /// Mirrors the current cart into WaiterCartStore so it survives navigation
@@ -1127,7 +1184,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
   }
 
   void _showCartSheet() {
-    showModalBottomSheet(
+    showBlurredBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
@@ -1649,27 +1706,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
       return;
     }
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const Center(
-        child: Card(
-          child: Padding(
-            padding: EdgeInsets.all(20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(
-                  valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF0C0E2B)),
-                ),
-                SizedBox(height: 16),
-                Text('Placing order...'),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
+    showLoadingDialog(context, 'Placing order…');
 
     try {
       final now = DateTime.now();
@@ -1692,13 +1729,17 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
 
       final subtotal = _totalPrice;
       final taxAmount = 0.0;
-      final serviceCharge = 0.0;
       final discountAmount = 0.0;
-      final grandTotal = subtotal + taxAmount + serviceCharge - discountAmount;
+      // KTV room: the sessions picked in the Switch Menu cart (default 1,
+      // 0 = waived). The server adds one session itself, so send the rest.
+      final roomRate = widget.table.id != 0 ? widget.table.roomCharge : 0.0;
+      final roomQty = roomRate > 0 ? WaiterCartStore.instance.roomChargeQty(_cartKey) : 1.0;
+      final serviceCharge = roomRate > 0 ? (roomQty - 1) * roomRate : 0.0;
+      final grandTotal = subtotal + taxAmount + roomRate + serviceCharge - discountAmount;
 
       final result = await ApiService.createOrder(
         orderNo: orderNo,
-        tableId: widget.table.id,
+        tableId: widget.table.id == 0 ? null : widget.table.id,
         tableNumber: widget.table.number,
         orderType: _selectedOrderType,
         subtotal: subtotal,
@@ -1707,6 +1748,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         discountAmount: discountAmount,
         grandTotal: grandTotal,
         items: items,
+        roomChargeRate: roomRate,
       );
 
       _closeLoadingDialog();
@@ -1714,13 +1756,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
       if (!mounted) return;
 
       if (result['unauthorized'] == true) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Session expired. Please login again.'),
-            duration: Duration(seconds: 3),
-            backgroundColor: Colors.red,
-          ),
-        );
+        showFloatingError(context, title: 'Session expired', message: 'Please login again.');
         return;
       }
 
@@ -1733,13 +1769,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
             status: 2, // CONFIRMED
           );
           if (statusResult['unauthorized'] == true && mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Session expired. Please login again.'),
-                duration: Duration(seconds: 3),
-                backgroundColor: Colors.red,
-              ),
-            );
+            showFloatingError(context, title: 'Session expired', message: 'Please login again.');
             return;
           }
         }
@@ -1748,10 +1778,10 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         });
         WaiterCartStore.instance.clear(_cartKey);
         final isOffline = result['is_offline'] == true;
-        showCenterPopup(
+        showFloatingResult(
           context,
-          icon: isOffline ? Icons.cloud_off_rounded : Icons.check_circle,
-          accentColor: isOffline ? const Color(0xFFD97706) : Colors.green,
+          warning: isOffline,
+          duration: const Duration(milliseconds: 2400),
           title: isOffline ? 'Order Saved Locally (Offline)' : 'Order Placed Successfully!',
           subtitle: isOffline
               ? 'Order #${result['data']?['order_no'] ?? orderNo} saved to device. Will auto-sync once WiFi has internet.'
@@ -1762,51 +1792,19 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         // same as the "add items to existing order" flow below.
         Navigator.pop(context);
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(result['error'] ?? 'Failed to place order'),
-            duration: const Duration(seconds: 3),
-            backgroundColor: Colors.red,
-          ),
-        );
+        showFloatingError(context, title: 'Order not placed', message: (result['error'] ?? 'Failed to place order').toString());
       }
     } catch (e) {
       _closeLoadingDialog();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error placing order: ${e.toString()}'),
-          duration: const Duration(seconds: 3),
-          backgroundColor: Colors.red,
-        ),
-      );
+      showFloatingError(context, title: 'Order not placed', message: e.toString());
     }
   }
 
   Future<void> _addItemsToExistingOrder() async {
     if (widget.existingOrder == null) return;
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const Center(
-        child: Card(
-          child: Padding(
-            padding: EdgeInsets.all(20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(
-                  valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF0C0E2B)),
-                ),
-                SizedBox(height: 16),
-                Text('Adding items to order...'),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
+    showLoadingDialog(context, 'Adding items…');
 
     try {
       final items = _cart.map((cartItem) {
@@ -1833,13 +1831,7 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
       if (!mounted) return;
 
       if (result['unauthorized'] == true) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Session expired. Please login again.'),
-            duration: Duration(seconds: 3),
-            backgroundColor: Colors.red,
-          ),
-        );
+        showFloatingError(context, title: 'Session expired', message: 'Please login again.');
         return;
       }
 
@@ -1850,10 +1842,10 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
           _cart.clear();
         });
         WaiterCartStore.instance.clear(_cartKey);
-        showCenterPopup(
+        showFloatingResult(
           context,
-          icon: isOffline ? Icons.cloud_off_rounded : Icons.check_circle,
-          accentColor: isOffline ? const Color(0xFFD97706) : Colors.green,
+          warning: isOffline,
+          duration: const Duration(milliseconds: 2400),
           title: isOffline ? 'Items Added Locally (Offline)' : 'Items Added Successfully!',
           subtitle: isOffline
               ? '$itemCount item(s) saved locally to order. Will auto-sync when online.'
@@ -1861,24 +1853,12 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
         );
         Navigator.pop(context);
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(result['error'] ?? 'Failed to add items to order'),
-            duration: const Duration(seconds: 3),
-            backgroundColor: Colors.red,
-          ),
-        );
+        showFloatingError(context, title: 'Items not added', message: (result['error'] ?? 'Failed to add items to order').toString());
       }
     } catch (e) {
       _closeLoadingDialog();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error adding items: ${e.toString()}'),
-          duration: const Duration(seconds: 3),
-          backgroundColor: Colors.red,
-        ),
-      );
+      showFloatingError(context, title: 'Items not added', message: e.toString());
     }
   }
 
@@ -1933,6 +1913,9 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
 
   @override
   Widget build(BuildContext context) {
+    if (_switchMode) {
+      return const Scaffold(backgroundColor: Color(0xFFF5F6F0));
+    }
     final mediaQuery = MediaQuery.of(context);
     final screenWidth = mediaQuery.size.width;
     final isLandscape = mediaQuery.orientation == Orientation.landscape;
@@ -1959,26 +1942,23 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
       backgroundColor: const Color(0xFFF5F6F0),
       appBar: isMobile
           ? AppBar(
-              title: Text(
-                tableLabel,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: GoogleFonts.urbanist(
-                  fontSize: 19,
-                  fontWeight: FontWeight.w800,
-                  color: const Color(0xFF0C0E2B),
-                  letterSpacing: 0.2,
+              // Same logo + title as the Switch Menu header.
+              title: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: QuickMenuBrand(
+                  tableLabel: quickMenuTableLabel(widget.table.number),
                 ),
               ),
+              toolbarHeight: 84,
               centerTitle: true,
-              leadingWidth: 60,
               leading: IconButton(
                 icon: const HomeGlyph(size: 32, color: Color(0xFF0C0E2B)),
                 tooltip: 'Home',
                 onPressed: () => Navigator.pop(context),
               ),
               actions: [
+                QuickMenuButton(onPressed: _openQuickMenu),
+                const SizedBox(width: 4),
                 IconButton(
                   icon: const Icon(Icons.settings, size: 28),
                   color: const Color(0xFF0C0E2B),
@@ -2219,6 +2199,8 @@ class _GetOrderPageState extends State<GetOrderPage> with TickerProviderStateMix
                                 ),
                               ),
                               const SizedBox(width: 16),
+                              QuickMenuButton(onPressed: _openQuickMenu),
+                              const SizedBox(width: 8),
                               IconButton(
                                 icon: const Icon(Icons.settings, size: 30),
                                 color: const Color(0xFF0C0E2B),

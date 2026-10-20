@@ -3,6 +3,8 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
+import '../../shared/login_accounts.dart';
+import '../../shared/session_presence.dart';
 import '../../shared/floor_utils.dart';
 import '../../shared/globals.dart';
 import 'socket_service.dart';
@@ -54,7 +56,14 @@ class ApiService {
   }
 
   // Login API endpoint
-  static Future<Map<String, dynamic>> login(String username, String password) async {
+  /// [rejectIfActive]: the login picker's sign-in — the server answers 409
+  /// `ACCOUNT_IN_USE` instead of taking over an account that's signed in on
+  /// another tablet (returned here as `code`).
+  static Future<Map<String, dynamic>> login(
+    String username,
+    String password, {
+    bool rejectIfActive = false,
+  }) async {
     try {
       final url = Uri.parse('${await baseUrl}/api/login');
       
@@ -67,6 +76,7 @@ class ApiService {
         body: jsonEncode({
           'username': username,
           'password': password,
+          if (rejectIfActive) 'reject_if_active': true,
         }),
       ).timeout(_httpTimeout);
 
@@ -118,6 +128,7 @@ class ApiService {
         return {
           'success': false,
           'error': data['error'] ?? 'Login failed',
+          'code': data['code'],
         };
       }
     } catch (e) {
@@ -163,13 +174,18 @@ class ApiService {
   // Logout
   static Future<void> logout() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.clear();
+    final accessToken = prefs.getString('access_token');
+    final serverUrl = await baseUrl;
+    // Keeps the tablet's login picker data (account list, one-tap logins).
+    await LoginAccountsStore.clearPreferencesKeepingLoginData(prefs);
     await prefs.setBool('is_logged_in', false);
     _cachedBaseUrl = null;
     // Tear the socket all the way down so the next login always starts a
     // brand-new connection (fresh branch id, no leftover reconnection state
     // from a session that never managed to connect).
     SocketService.disconnect();
+    // Frees the account in other tablets' login picker right away.
+    await SessionPresence.endOnServer(accessToken, serverUrl);
   }
 
   // Get authentication headers

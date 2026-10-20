@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../../shared/widgets/centered_section_header.dart';
 import '../../shared/widgets/offline_order_badge.dart';
 import '../waiter_models.dart';
 import '../widgets/waiter_ui.dart';
 
 const _navy = Color(0xFF0C0E2B);
+const _navy2 = Color(0xFF1B1E4A);
 const _gold = Color(0xFFE8C468);
 
 class NewOrdersTab extends StatelessWidget {
@@ -219,7 +221,7 @@ class _OrdersScrollView extends StatelessWidget {
                 : 1;
         // New Orders cards are taller (Edit/Confirm buttons row); Order
         // List cards don't have that row.
-        final mainAxisExtent = showConfirm ? 192.0 : 132.0;
+        final mainAxisExtent = showConfirm ? 214.0 : 140.0;
 
         return CustomScrollView(
           physics: const AlwaysScrollableScrollPhysics(),
@@ -227,7 +229,10 @@ class _OrdersScrollView extends StatelessWidget {
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
               sliver: SliverToBoxAdapter(
-                child: SectionHeader(title: title, subtitle: subtitle),
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: CenteredSectionHeader(title: title, subtitle: subtitle),
+                ),
               ),
             ),
             if (orders.isEmpty)
@@ -279,19 +284,45 @@ class _OrderCard extends StatelessWidget {
     this.onTap,
   });
 
+  // Status colors tuned for the navy card (the shared StatusChip is for white).
+  static (String, Color) _status(int status) {
+    switch (status) {
+      case 3:
+        return ('Pending', const Color(0xFFFF6B6B));
+      case 2:
+        return ('Confirmed', const Color(0xFFF59E0B));
+      case 1:
+        return ('Settled', const Color(0xFF4ADE80));
+      case -1:
+        return ('Cancelled', const Color(0xFFFF6B6B));
+      default:
+        return ('Unknown', Colors.grey);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final (statusLabel, statusColor) = _status(order.status);
+    final rawTable = (order.tableNumber ?? '').trim();
+    final tableName = rawTable.isEmpty
+        ? '-'
+        : (rawTable.toLowerCase().startsWith('table') ? rawTable.substring(5).trim() : rawTable);
+
     final card = Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _gold.withValues(alpha: 0.3)),
+        borderRadius: BorderRadius.circular(16),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [_navy, _navy2],
+        ),
+        border: Border.all(color: _gold.withValues(alpha: 0.25)),
         boxShadow: [
           BoxShadow(
-            color: _navy.withValues(alpha: 0.06),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
+            color: _navy.withValues(alpha: 0.25),
+            blurRadius: 16,
+            offset: const Offset(0, 8),
           ),
         ],
       ),
@@ -306,80 +337,113 @@ class _OrderCard extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: GoogleFonts.urbanist(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16,
-                    color: _navy,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 12.5,
+                    color: Colors.white.withValues(alpha: 0.65),
                   ),
                 ),
               ),
               OfflineOrderBadge(orderId: order.id),
               const SizedBox(width: 6),
-              StatusChip(status: order.status),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3.5),
+                decoration: BoxDecoration(
+                  color: statusColor.withValues(alpha: 0.18),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: statusColor.withValues(alpha: 0.6)),
+                ),
+                child: Text(
+                  statusLabel,
+                  style: GoogleFonts.urbanist(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                    color: statusColor,
+                  ),
+                ),
+              ),
             ],
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 8),
           Row(
             children: [
-              Icon(Icons.table_bar_outlined, size: 15, color: _navy.withValues(alpha: 0.55)),
-              const SizedBox(width: 6),
+              const Icon(Icons.table_restaurant_rounded, size: 20, color: _gold),
+              const SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  'Table ${order.tableNumber ?? '-'}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.urbanist(color: Colors.grey[700], fontSize: 13.5),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    (order.isTakeOut ? order.takeOutLabel : 'TABLE $tableName').toUpperCase(),
+                    maxLines: 1,
+                    style: GoogleFonts.urbanist(
+                      fontSize: 21,
+                      fontWeight: FontWeight.w900,
+                      color: Colors.white,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
                 ),
               ),
             ],
           ),
           const SizedBox(height: 6),
           Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              Icon(Icons.receipt_long_outlined, size: 15, color: _navy.withValues(alpha: 0.55)),
-              const SizedBox(width: 6),
               Text(
                 '${order.items.length} item(s)',
-                style: GoogleFonts.urbanist(color: Colors.grey[700], fontSize: 13.5),
+                style: GoogleFonts.urbanist(
+                  color: Colors.white.withValues(alpha: 0.7),
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
               const Spacer(),
               Text(
                 '₱${order.grandTotal.toStringAsFixed(2)}',
                 style: GoogleFonts.urbanist(
-                  fontWeight: FontWeight.bold,
-                  color: _navy,
-                  fontSize: 14.5,
+                  fontWeight: FontWeight.w900,
+                  color: _gold,
+                  fontSize: 22,
                 ),
               ),
             ],
           ),
           if (showConfirm) ...[
-            const SizedBox(height: 14),
+            const Spacer(),
             Row(
               children: [
                 Expanded(
                   child: OutlinedButton(
                     onPressed: () => onEdit(order),
                     style: OutlinedButton.styleFrom(
-                      foregroundColor: _navy,
-                      side: BorderSide(color: _navy.withValues(alpha: 0.3)),
-                      padding: const EdgeInsets.symmetric(vertical: 11),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      foregroundColor: _gold,
+                      side: BorderSide(color: _gold.withValues(alpha: 0.6)),
+                      minimumSize: const Size.fromHeight(46),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
-                    child: Text('Edit Order', style: GoogleFonts.urbanist(fontWeight: FontWeight.w600)),
+                    child: Text(
+                      'Edit Order',
+                      style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 14.5),
+                    ),
                   ),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 10),
                 Expanded(
-                  child: ElevatedButton(
+                  child: ElevatedButton.icon(
                     onPressed: () => onConfirm(order),
+                    icon: const Icon(Icons.check_circle_rounded, size: 19),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: _gold,
                       foregroundColor: _navy,
                       elevation: 0,
-                      padding: const EdgeInsets.symmetric(vertical: 11),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      minimumSize: const Size.fromHeight(46),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
-                    child: Text('Confirm Order', style: GoogleFonts.urbanist(fontWeight: FontWeight.bold)),
+                    label: Text(
+                      'Confirm',
+                      style: GoogleFonts.urbanist(fontWeight: FontWeight.w900, fontSize: 15),
+                    ),
                   ),
                 ),
               ],
@@ -393,9 +457,9 @@ class _OrderCard extends StatelessWidget {
 
     return Material(
       color: Colors.transparent,
-      borderRadius: BorderRadius.circular(14),
+      borderRadius: BorderRadius.circular(16),
       child: InkWell(
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(16),
         onTap: () => onTap!(order),
         child: card,
       ),

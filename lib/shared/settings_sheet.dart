@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../shared/globals.dart';
 import '../shared/app_translations.dart';
 import '../shared/update_dialog.dart';
+import 'widgets/blurred_dialog.dart';
 
 typedef AsyncCallback = Future<void> Function();
 
@@ -11,7 +12,7 @@ Future<void> showAppSettingsSheet({
   required BuildContext context,
   AsyncCallback? onLogout,
 }) async {
-  await showModalBottomSheet<void>(
+  await showBlurredBottomSheet<void>(
     context: context,
     backgroundColor: const Color(0xFFF5F6F0),
     shape: const RoundedRectangleBorder(

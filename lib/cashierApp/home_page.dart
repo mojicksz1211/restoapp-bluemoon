@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' show ImageFilter;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -10,7 +11,13 @@ import '../shared/sound_service.dart';
 import '../shared/floor_utils.dart';
 import '../shared/globals.dart';
 import '../waiterApp/pages/get_order_page.dart' as waiter_order;
-import 'widgets/bill_out_modal.dart';
+import '../waiterApp/widgets/extend_room_charge_dialog.dart';
+import '../waiterApp/widgets/room_charge_history.dart';
+import '../waiterApp/widgets/room_time_warning.dart';
+import '../waiterApp/pages/take_out_launcher.dart';
+import '../waiterApp/pages/quick_menu_page.dart' show QuickMenuBrand;
+import 'widgets/order_details_sheet.dart';
+import 'widgets/activity_log_view.dart';
 import '../waiterApp/widgets/transfer_table_modal.dart';
 import '../waiterApp/widgets/edit_order_bottom_sheet.dart';
 import '../waiterApp/widgets/menu_picker_sheet.dart';
@@ -20,8 +27,15 @@ import '../shared/lan_broadcast_service.dart';
 import '../shared/background_service.dart';
 import '../shared/offline_sync_service.dart';
 import '../shared/widgets/offline_order_badge.dart';
+import '../shared/widgets/card_cancel_button.dart';
 import '../shared/widgets/offline_sync_banner.dart';
+import '../shared/widgets/loading_overlay.dart';
+import '../shared/widgets/cancel_order_dialog.dart';
+import '../shared/widgets/floating_result.dart';
+import '../shared/widgets/centered_section_header.dart';
+import '../shared/widgets/sliding_segments.dart';
 import '../shared/update_dialog.dart';
+import '../shared/widgets/blurred_dialog.dart';
 
 class SettlementData {
   final String paymentMethod;
@@ -162,17 +176,41 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   String? _floorScope;
   final Set<int> _joinedOrderIds = {};
   String _searchQuery = '';
+  // Bumped whenever orders change, so the Activity tab refreshes itself.
+  final ValueNotifier<int> _activitySignal = ValueNotifier<int>(0);
   final TextEditingController _searchController = TextEditingController();
   final Set<int> _pinnedOrderIds = {};
   final Set<int> _unacknowledgedOrderIds = {};
   final List<WaiterOrder> _alertOrdersQueue = [];
-  bool _alertIsAddedItems = false;
+  // Why each queued order is alerting (items added / edited, cancelled, room
+  // charge changed). An order missing here is a brand-new order.
+  final Map<int, _OrderAlertInfo> _alertInfo = {};
+  // This tablet's own user id — the cashier isn't alerted about its own changes.
+  String? _myUserId;
+  // Orders this cashier just changed itself (settle, edit, cancel, add, room
+  // charge, transfer): the REST poll can't tell who changed an order, so it
+  // ignores these for a short while instead of alerting about our own action.
+  final Map<int, DateTime> _selfChangedAt = {};
+  // The last REST snapshot of each order. The poll compares against this,
+  // not [_orders] — socket events merge partial payloads into [_orders]
+  // (some carry no items or service charge), which would look like changes.
+  Map<int, WaiterOrder> _lastRestById = {};
+  // State (status / room charge / items) each order was last alerted for, so
+  // the poll doesn't repeat a change the socket already announced.
+  final Map<int, String> _alertedStateSig = {};
   
   VoidCallback? _disposeOrderUpdated;
   VoidCallback? _disposeOrderItemsAdded;
   VoidCallback? _disposeOrderCreated;
   VoidCallback? _disposeLanOrderCreated;
   VoidCallback? _disposeLanOrderItemsAdded;
+  VoidCallback? _disposeTableUpdated;
+  // A refresh asked for while another was running (e.g. right after a
+  // transfer / cancel): run it once that one finishes instead of dropping it,
+  // or the freed room keeps showing Occupied.
+  bool _reloadRequested = false;
+  // Counts fallback-poll ticks; tables are refetched on every 3rd one.
+  int _pollTick = 0;
 
   // Socket events arrive in bursts (the backend re-broadcasts every order on
   // connect and on any change). Coalesce the follow-up full refresh, guard
@@ -214,36 +252,51 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       return;
     }
 
-    final descriptions = <String>[];
-    // Put newest orders FIRST so the latest incoming order is announced immediately
+    // One phrase per kind of alert, newest order first.
+    final byKind = <_AlertKind, List<String>>{};
+    final seen = <String>{};
     for (final order in _alertOrdersQueue.reversed) {
       final desc = _getSpeechTableDescription(order.tableNumber, order.orderType);
-      if (!descriptions.contains(desc)) {
-        descriptions.add(desc);
-      }
+      if (!seen.add(desc)) continue;
+      final kind = _alertInfo[order.id]?.kind ?? _AlertKind.newOrder;
+      byKind.putIfAbsent(kind, () => []).add(desc);
     }
 
-    if (descriptions.isEmpty) {
+    if (byKind.isEmpty) {
       SoundService.stopRepeatingAlert();
       return;
     }
 
-    String speechText;
-    if (descriptions.length == 1) {
-      speechText = 'New order for ${descriptions[0]}';
-    } else if (descriptions.length == 2) {
-      speechText = 'New orders for ${descriptions[0]} and ${descriptions[1]}';
-    } else if (descriptions.length == 3) {
-      speechText = 'New orders for ${descriptions[0]}, ${descriptions[1]}, and ${descriptions[2]}';
-    } else if (descriptions.length == 4) {
-      speechText = 'New orders for ${descriptions[0]}, ${descriptions[1]}, ${descriptions[2]}, and ${descriptions[3]}';
-    } else {
-      // 5 or more tables: Announce the newest tables prominently + count of other pending tables
-      final newestTwo = [descriptions[0], descriptions[1]];
-      final remainingCount = descriptions.length - 2;
-      speechText = 'New order for ${newestTwo[0]} and ${newestTwo[1]}, with $remainingCount other pending tables';
+    const phrases = {
+      _AlertKind.newOrder: ('New order', 'New orders'),
+      _AlertKind.itemsAdded: ('Additional order', 'Additional orders'),
+      _AlertKind.itemsEdited: ('Order edited', 'Orders edited'),
+      _AlertKind.cancelled: ('Order cancelled', 'Orders cancelled'),
+      _AlertKind.roomCharge: ('Room charge updated', 'Room charges updated'),
+      _AlertKind.transferred: ('Table transfer', 'Table transfers'),
+    };
+    final parts = <String>[
+      for (final kind in _AlertKind.values)
+        if (byKind[kind] != null)
+          _speechFor(byKind[kind]!, singular: phrases[kind]!.$1, plural: phrases[kind]!.$2),
+    ];
+    SoundService.startRepeatingAlert(parts.join('. '));
+  }
+
+  String _speechFor(List<String> tables, {required String singular, required String plural}) {
+    switch (tables.length) {
+      case 1:
+        return '$singular for ${tables[0]}';
+      case 2:
+        return '$plural for ${tables[0]} and ${tables[1]}';
+      case 3:
+        return '$plural for ${tables[0]}, ${tables[1]}, and ${tables[2]}';
+      case 4:
+        return '$plural for ${tables[0]}, ${tables[1]}, ${tables[2]}, and ${tables[3]}';
+      default:
+        // 5 or more tables: the newest two by name + count of the rest
+        return '$singular for ${tables[0]} and ${tables[1]}, with ${tables.length - 2} other pending tables';
     }
-    SoundService.startRepeatingAlert(speechText);
   }
 
   void _acknowledgeOrder([int? orderId]) {
@@ -255,6 +308,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     setState(() {
       _unacknowledgedOrderIds.remove(orderId);
       _alertOrdersQueue.removeWhere((o) => o.id == orderId);
+      _alertInfo.remove(orderId);
     });
     if (_alertOrdersQueue.isEmpty) {
       SoundService.stopRepeatingAlert();
@@ -270,16 +324,20 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     setState(() {
       _unacknowledgedOrderIds.clear();
       _alertOrdersQueue.clear();
+      _alertInfo.clear();
     });
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
   }
 
-  bool _isGroundFloorOrder(WaiterOrder order) {
+  bool _isGroundFloorOrder(WaiterOrder order) =>
+      _isGroundFloorFor(order.floor, order.tableNumber);
+
+  bool _isGroundFloorFor(String? floor, String? tableNumber) {
     // The order's own floor (from its creator's account) wins over the
     // table-name heuristic below.
-    final orderFloor = normalizeFloor(order.floor);
+    final orderFloor = normalizeFloor(floor);
     if (orderFloor != null) return orderFloor == kFloorGround;
-    final numStr = (order.tableNumber ?? '').toUpperCase().trim();
+    final numStr = (tableNumber ?? '').toUpperCase().trim();
     final roomMatch = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(numStr);
     if (roomMatch != null) {
       final roomNum = int.tryParse(roomMatch.group(1) ?? '');
@@ -327,6 +385,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     final userData = await ApiService.getUserData();
     if (!mounted) return;
     setState(() {
+      _myUserId = userData['user_id']?.toString();
       _floorScope = userData['floor'];
       if (_floorScope == 'gf' || _floorScope == '2f') {
         _floorFilter = _floorScope!;
@@ -343,6 +402,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     // between app launch and the first didChangeAppLifecycleState call would
     // still show the banner even though the app is plainly already open.
     BackgroundServiceManager.reportUiForeground(true);
+    _roomTimeWarnings.start();
     OfflineSyncService.instance.addDataSyncedListener(_onDataSynced);
     // Floor scope must be known before the first table fetch resolves, so a
     // floor-scoped account never briefly renders the other floor's tables.
@@ -409,6 +469,8 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _roomTimeWarnings.dispose();
+    _activitySignal.dispose();
     OfflineSyncService.instance.removeDataSyncedListener(_onDataSynced);
     SoundService.stopRepeatingAlert();
     languageNotifier.removeListener(_onLanguageChanged);
@@ -429,11 +491,34 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     BackgroundServiceManager.reportUiForeground(state == AppLifecycleState.resumed);
+    if (state == AppLifecycleState.resumed) _roomTimeWarnings.check();
   }
 
+  // "15 minutes left" popup for rooms with a room charge.
+  late final RoomTimeWarningController _roomTimeWarnings = RoomTimeWarningController(
+    orders: () => _orders.where(_isOrderVisibleForFloorScope),
+    context: () => mounted ? context : null,
+    fallbackRateFor: (order) {
+      if (order.roomCharge > 0) return order.roomCharge;
+      for (final t in _tables) {
+        if (t.id == order.tableId) return t.roomCharge;
+      }
+      return 0;
+    },
+    onExtend: _extendRoomCharge,
+  );
+
   Future<void> _loadData({bool showSpinner = true}) async {
-    // Never let socket-triggered background refreshes stack up.
-    if (_isLoadingData) return;
+    // Never let socket-triggered background refreshes stack up — but don't
+    // drop this one either: it runs again once the current one is done, and
+    // callers awaiting it (after a transfer / cancel) wait for that.
+    if (_isLoadingData) {
+      _reloadRequested = true;
+      while (mounted && (_isLoadingData || _reloadRequested)) {
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
+      return;
+    }
     _isLoadingData = true;
 
     if (showSpinner) {
@@ -475,6 +560,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
           _menuItems = loadedMenu;
           _isLoading = false;
         });
+        _activitySignal.value++;
         _syncSocketOrderRooms();
       } else {
         setState(() {
@@ -493,7 +579,15 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       });
       debugPrint('❌ Error in _loadData: $e');
     } finally {
-      _isLoadingData = false;
+      _finishLoading();
+    }
+  }
+
+  void _finishLoading() {
+    _isLoadingData = false;
+    if (_reloadRequested && mounted) {
+      _reloadRequested = false;
+      unawaited(_loadData(showSpinner: false));
     }
   }
 
@@ -504,20 +598,36 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     if (_isLoadingData) return;
     _isLoadingData = true;
     try {
-      final ordersResult = await ApiService.getWaiterOrders();
+      // Tables too, every 3rd tick: with the socket down there's no
+      // table_updated event to say a room was freed.
+      final withTables = (_pollTick++ % 3) == 0;
+      final results = await Future.wait([
+        ApiService.getWaiterOrders(),
+        if (withTables) ApiService.getTables(),
+      ]);
+      final ordersResult = results[0];
       if (ordersResult['unauthorized'] == true) {
         await _redirectToLogin();
         return;
       }
       if (ordersResult['success'] == true) {
         final ordersData = List<Map<String, dynamic>>.from(ordersResult['data']);
-        _applyFreshOrders(ordersData);
+        final tablesResult = withTables ? results[1] : null;
+        final freshTables = tablesResult != null &&
+                tablesResult['success'] == true &&
+                tablesResult['data'] is List
+            ? List<Map<String, dynamic>>.from(tablesResult['data']).map(WaiterTable.fromApi).toList()
+            : null;
+        _applyFreshOrders(
+          ordersData,
+          extra: freshTables == null ? null : () => _tables = _applyFloorScope(freshTables),
+        );
         _syncSocketOrderRooms();
       }
     } catch (e) {
       debugPrint('❌ Error in _pollOrdersOnly: $e');
     } finally {
-      _isLoadingData = false;
+      _finishLoading();
     }
   }
 
@@ -529,6 +639,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   /// fields (tables, menu, loading flag).
   void _applyFreshOrders(List<Map<String, dynamic>> ordersData, {VoidCallback? extra}) {
     final previousIds = _orders.map((o) => o.id).toSet();
+    final previousById = {for (final o in _orders) o.id: o};
     // Total item quantity before this refresh, so an order we already knew
     // about can still be detected as "items were added" below — previousIds
     // alone only tells us the order itself isn't new. Quantity, not
@@ -561,6 +672,13 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
             if (!previousIds.contains(o.id)) return false;
             if (o.status != 2 && o.status != 3) return false;
             if (!_isOrderVisibleForFloorScope(o)) return false;
+            if (_isRecentSelfChange(o.id)) return false;
+            // Lines removed too → that's an edit (handled below), not just additions.
+            final restBefore = _lastRestById[o.id];
+            if (restBefore != null &&
+                WaiterOrder.addedItemsBetween(o, restBefore).isNotEmpty) {
+              return false;
+            }
             final previousQty = previousItemQty[o.id];
             final currentQty = _totalQuantity(o);
             if (previousQty == null || currentQty <= previousQty) return false;
@@ -569,6 +687,50 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
             return true;
           }).toList()
         : const <WaiterOrder>[];
+
+    // Edits, cancels and room-charge changes the socket missed, against the
+    // previous REST snapshot (complete data, unlike socket-merged [_orders]).
+    final changeAlerts = <(WaiterOrder, _OrderAlertInfo)>[];
+    if (_hasLoadedOrdersOnce) {
+      final addedIds = itemsAddedOrders.map((o) => o.id).toSet();
+      for (final o in freshOrders) {
+        final before = _lastRestById[o.id];
+        if (before == null || (before.status != 2 && before.status != 3)) continue;
+        if (addedIds.contains(o.id) || _isRecentSelfChange(o.id)) continue;
+        if (!_isOrderVisibleForFloorScope(o)) continue;
+        if (_alertedStateSig[o.id] == _orderStateSig(o)) continue; // socket already told us
+        _OrderAlertInfo? info;
+        if (o.status == -1) {
+          info = const _OrderAlertInfo(_AlertKind.cancelled);
+        } else if ((o.status == 2 || o.status == 3) &&
+            o.tableId != null &&
+            before.tableId != null &&
+            o.tableId != before.tableId) {
+          info = _OrderAlertInfo(
+            _AlertKind.transferred,
+            fromTable: before.tableNumber,
+            toTable: o.tableNumber,
+          );
+        } else if (o.status == 2 || o.status == 3) {
+          final removed = WaiterOrder.addedItemsBetween(o, before);
+          if (removed.isNotEmpty) {
+            info = _OrderAlertInfo(
+              _AlertKind.itemsEdited,
+              added: WaiterOrder.addedItemsBetween(before, o),
+              removed: removed,
+            );
+          } else if ((o.serviceCharge - before.serviceCharge).abs() > 0.005) {
+            info = _OrderAlertInfo(
+              _AlertKind.roomCharge,
+              roomChargeFrom: before.serviceCharge,
+              roomChargeTo: o.serviceCharge,
+            );
+          }
+        }
+        if (info != null) changeAlerts.add((o, info));
+      }
+    }
+    _lastRestById = {for (final o in freshOrders) o.id: o};
 
     setState(() {
       _orders = freshOrders;
@@ -586,12 +748,21 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       for (final order in itemsAddedOrders) {
         debugPrint('✓ Poll: items added to order ${order.id} (socket missed it)');
         _unacknowledgedOrderIds.add(order.id);
-        _enqueueAlert(order, addedItems: true);
+        _enqueueAlert(
+          order,
+          addedItems: true,
+          newItems: WaiterOrder.addedItemsBetween(previousById[order.id], order),
+        );
+      }
+      for (final (order, info) in changeAlerts) {
+        debugPrint('✓ Poll: ${info.kind.name} on order ${order.id} (socket missed it)');
+        _unacknowledgedOrderIds.add(order.id);
+        _enqueueAlert(order, info: info);
       }
       extra?.call();
     });
     _hasLoadedOrdersOnce = true;
-    if (newlyAppeared.isNotEmpty || itemsAddedOrders.isNotEmpty) {
+    if (newlyAppeared.isNotEmpty || itemsAddedOrders.isNotEmpty || changeAlerts.isNotEmpty) {
       _updateRepeatingTtsAnnouncement();
     }
   }
@@ -609,20 +780,20 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     if (_isManualRefreshing) return;
     setState(() => _isManualRefreshing = true);
     try {
-      await _loadData(showSpinner: false);
+      // Blocking loader so the tap clearly did something. A refresh is often
+      // over in a blink, so keep it up for a minimum of 700ms or the card
+      // would just flash.
+      await runWithLoader<void>(
+        context,
+        message: 'Refreshing…',
+        task: () => Future.wait<void>([
+          _loadData(showSpinner: false),
+          Future<void>.delayed(const Duration(milliseconds: 700)),
+        ]),
+      );
     } finally {
       if (mounted) setState(() => _isManualRefreshing = false);
     }
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        const SnackBar(
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 1),
-          content: Text('Refreshed'),
-        ),
-      );
   }
 
   Future<void> _initializeSocket() async {
@@ -648,6 +819,15 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
         _handleSocketOrderEvent(data, isFullUpdate: true, eventType: 'order_created');
       });
 
+      // A room freed / taken (transfer, settle, cancel — by anyone): the
+      // server broadcasts it to the role rooms; without this the cashier only
+      // saw it on its next full refresh.
+      _disposeTableUpdated?.call();
+      _disposeTableUpdated = SocketService.addTableUpdateListener((data) {
+        if (!mounted) return;
+        _handleSocketTableEvent(data);
+      });
+
       // LAN fallback: same handler, just fed from a WiFi-local broadcast
       // instead of the cloud socket — see lan_broadcast_service.dart.
       _disposeLanOrderCreated?.call();
@@ -668,6 +848,42 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     }
   }
 
+  /// `table_updated` from the server — same handling as waiterApp's.
+  void _handleSocketTableEvent(Map<String, dynamic> data) {
+    final rawTableData = data['table'];
+    final tableData = rawTableData is Map
+        ? Map<String, dynamic>.from(rawTableData)
+        : Map<String, dynamic>.from(data);
+    final action = (data['action'] ?? tableData['action'])?.toString() ?? 'updated';
+    tableData['id'] ??= tableData['table_id'] ?? data['table_id'];
+    tableData['table_number'] ??= tableData['tableNumber'];
+    tableData['capacity'] ??= tableData['CAPACITY'];
+    tableData['status'] ??= tableData['STATUS'];
+
+    final tableIdRaw = tableData['id'];
+    final tableId = tableIdRaw is int ? tableIdRaw : int.tryParse(tableIdRaw?.toString() ?? '');
+    if (tableId == null) return;
+    if (!_isForThisBranch({'branch_id': tableData['branch_id'] ?? tableData['BRANCH_ID'] ?? data['branch_id']})) {
+      return;
+    }
+
+    try {
+      setState(() {
+        if (action == 'deleted') {
+          _tables = _tables.where((t) => t.id != tableId).toList();
+          return;
+        }
+        final updatedTable = WaiterTable.fromApi(tableData);
+        final index = _tables.indexWhere((t) => t.id == tableId);
+        _tables = _applyFloorScope(index == -1
+            ? [..._tables, updatedTable]
+            : [for (final t in _tables) t.id == tableId ? updatedTable : t]);
+      });
+    } catch (e) {
+      debugPrint('Error updating table from socket in cashier_home_page: $e');
+    }
+  }
+
   void _handleSocketOrderEvent(Map<String, dynamic> data, {bool isFullUpdate = false, String eventType = ''}) {
     if (!mounted) return;
 
@@ -679,6 +895,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       debugPrint('↪︎ Socket event for another branch — ignored');
       return;
     }
+    _activitySignal.value++;
 
     final rawOrderData = data['order'];
     final orderData = rawOrderData is Map
@@ -714,8 +931,21 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
     try {
       final normalized = _normalizeSocketOrder(orderData);
-      final updatedOrder = WaiterOrder.fromApi(normalized);
-
+      final parsed = WaiterOrder.fromApi(normalized);
+      final updatedOrder = existingIndex == -1
+          ? parsed
+          : _orders[existingIndex].keepRoomChargesIn(parsed, normalized);
+      // `order_created` also fires for orders that arrive already settled —
+      // Loyverse receipt imports and the admin's Manual Order / Upload
+      // Receipt, often for a past day. Those are history, not something for
+      // the cashier to act on (same rule as the REST poll in _applyFreshOrders).
+      final isActiveOrder = updatedOrder.status == 2 || updatedOrder.status == 3;
+      // What a tablet changed and who (newer backends) — our own changes don't alert.
+      final rawChange = orderData['change'] ?? data['change'];
+      final change = rawChange is Map ? Map<String, dynamic>.from(rawChange) : null;
+      final byMe = change != null &&
+          _myUserId != null &&
+          change['by']?.toString() == _myUserId;
 
       // Queue order for alert and update repeating voice announcement.
       // A genuinely new order always arrives as an `order_created` event; an
@@ -723,6 +953,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       // branch's traffic (the backend broadcasts globally), so it must not
       // alert. Alert each order at most once.
       if (eventType == 'order_created' &&
+          isActiveOrder &&
           _isOrderVisibleForFloorScope(updatedOrder) &&
           _shouldAlert(updatedOrder)) {
         setState(() {
@@ -731,13 +962,36 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
         });
         _updateRepeatingTtsAnnouncement();
       } else if (!isNewOrder &&
+          !byMe &&
           (eventType == 'order_items_added' || data['items_added'] != null)) {
         final currentQty = _totalQuantity(updatedOrder);
         if (_lastAlertedItemsQty[updatedOrder.id] != currentQty) {
           _lastAlertedItemsQty[updatedOrder.id] = currentQty;
+          final newItems = WaiterOrder.addedItemsBetween(_orders[existingIndex], updatedOrder);
           setState(() {
             _unacknowledgedOrderIds.add(updatedOrder.id);
-            _enqueueAlert(updatedOrder, addedItems: true);
+            _enqueueAlert(
+              updatedOrder,
+              info: _OrderAlertInfo(
+                _AlertKind.itemsAdded,
+                added: newItems,
+                byName: change?['by_name']?.toString(),
+              ),
+            );
+          });
+          _updateRepeatingTtsAnnouncement();
+        }
+      } else if (!isNewOrder &&
+          !byMe &&
+          eventType == 'order_updated' &&
+          change != null &&
+          _isOrderVisibleForFloorScope(updatedOrder)) {
+        // Edited / cancelled / room charge changed by a waiter (or another cashier).
+        final info = _changeAlertFor(_orders[existingIndex], updatedOrder, change);
+        if (info != null) {
+          setState(() {
+            _unacknowledgedOrderIds.add(updatedOrder.id);
+            _enqueueAlert(updatedOrder, info: info);
           });
           _updateRepeatingTtsAnnouncement();
         }
@@ -748,7 +1002,11 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       // backend broadcasts globally). Don't splice it in — the debounced
       // _loadData (branch-scoped) is the source of truth for which orders
       // exist. Only `order_created` adds a new order locally.
-      if (existingIndex == -1 && eventType != 'order_created') {
+      // An already-settled `order_created` (import / manual order) isn't
+      // spliced in either: the refresh picks it up for History if it belongs
+      // to today.
+      if (existingIndex == -1 &&
+          (eventType != 'order_created' || !isActiveOrder)) {
         _scheduleSocketRefresh();
         return;
       }
@@ -757,6 +1015,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
         if (existingIndex == -1) {
           debugPrint('✓ Socket: Adding new order $orderId');
           _orders = [..._orders, updatedOrder];
+          _tables = applyOrderTableChange(_tables, _orders, null, updatedOrder);
         } else {
           final existingOrder = _orders[existingIndex];
           
@@ -788,6 +1047,9 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
           final nextOrders = List<WaiterOrder>.from(_orders);
           nextOrders[existingIndex] = mergedOrder;
           _orders = nextOrders;
+          // Moved / settled / cancelled: free the room it left right away,
+          // even if the server's table_updated event never arrives.
+          _tables = applyOrderTableChange(_tables, nextOrders, existingOrder, mergedOrder);
           for (int i = 0; i < _alertOrdersQueue.length; i++) {
             if (_alertOrdersQueue[i].id == updatedOrder.id) {
               _alertOrdersQueue[i] = mergedOrder;
@@ -838,13 +1100,90 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
   /// Add/refresh an order in the alert queue, keeping it bounded so a burst of
   /// events can't grow it without limit. Call inside setState.
-  void _enqueueAlert(WaiterOrder order, {required bool addedItems}) {
-    _alertIsAddedItems = addedItems;
+  void _enqueueAlert(
+    WaiterOrder order, {
+    bool addedItems = false,
+    List<WaiterOrderItem>? newItems,
+    _OrderAlertInfo? info,
+  }) {
+    final change = info ??
+        (addedItems
+            ? _OrderAlertInfo(_AlertKind.itemsAdded, added: newItems ?? const [])
+            : null);
+    final queued = _alertOrdersQueue.any((o) => o.id == order.id);
+    final previous = _alertInfo[order.id];
+    if (change == null) {
+      _alertInfo.remove(order.id);
+    } else if (queued && previous == null && change.kind != _AlertKind.cancelled) {
+      // Still an unacknowledged NEW order — keep showing it whole.
+    } else {
+      // Several changes before the cashier acknowledges add up.
+      _alertInfo[order.id] = previous == null ? change : previous.mergedWith(change);
+    }
+    if (change != null) _alertedStateSig[order.id] = _orderStateSig(order);
     _alertOrdersQueue.removeWhere((o) => o.id == order.id);
     _alertOrdersQueue.add(order);
     if (_alertOrdersQueue.length > _maxAlertQueue) {
       _alertOrdersQueue.removeRange(0, _alertOrdersQueue.length - _maxAlertQueue);
+      final keep = _alertOrdersQueue.map((o) => o.id).toSet();
+      _alertInfo.removeWhere((id, _) => !keep.contains(id));
     }
+  }
+
+  /// status | room charge | items — what a change alert was raised for.
+  String _orderStateSig(WaiterOrder o) {
+    final items = [
+      for (final i in o.items) '${i.menuId ?? i.name.toLowerCase()}:${i.quantity}',
+    ]..sort();
+    return '${o.status}|${o.tableId}|${o.serviceCharge.toStringAsFixed(2)}|${items.join(',')}';
+  }
+
+  void _markSelfChange(int orderId) => _selfChangedAt[orderId] = DateTime.now();
+
+  bool _isRecentSelfChange(int orderId) {
+    final at = _selfChangedAt[orderId];
+    return at != null && DateTime.now().difference(at) < const Duration(seconds: 60);
+  }
+
+  /// The notice for a waiter's change to an order we already show, from its
+  /// socket event's `change` ({type, by_name, from, to}); null when nothing
+  /// the cashier needs to hear about changed.
+  _OrderAlertInfo? _changeAlertFor(
+    WaiterOrder before,
+    WaiterOrder after,
+    Map<String, dynamic> change,
+  ) {
+    final byName = change['by_name']?.toString();
+    switch (change['type']?.toString()) {
+      case 'items_edited':
+        final added = WaiterOrder.addedItemsBetween(before, after);
+        final removed = WaiterOrder.addedItemsBetween(after, before);
+        if (added.isEmpty && removed.isEmpty) return null;
+        return _OrderAlertInfo(_AlertKind.itemsEdited, added: added, removed: removed, byName: byName);
+      case 'cancelled':
+        final wasActive = before.status == 2 || before.status == 3;
+        return wasActive ? _OrderAlertInfo(_AlertKind.cancelled, byName: byName) : null;
+      case 'transferred':
+        final fromTable = change['from_table']?.toString() ?? before.tableNumber;
+        final toTable = change['to_table']?.toString() ?? after.tableNumber;
+        return _OrderAlertInfo(
+          _AlertKind.transferred,
+          fromTable: fromTable,
+          toTable: toTable,
+          byName: byName,
+        );
+      case 'room_charge':
+        final from = (change['from'] as num?)?.toDouble() ?? before.serviceCharge;
+        final to = (change['to'] as num?)?.toDouble() ?? after.serviceCharge;
+        if ((from - to).abs() < 0.005) return null;
+        return _OrderAlertInfo(
+          _AlertKind.roomCharge,
+          roomChargeFrom: from,
+          roomChargeTo: to,
+          byName: byName,
+        );
+    }
+    return null;
   }
 
   /// True the first time this order is seen, by either id or order_no —
@@ -904,6 +1243,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     _disposeOrderCreated?.call();
     _disposeLanOrderCreated?.call();
     _disposeLanOrderItemsAdded?.call();
+    _disposeTableUpdated?.call();
   }
 
   void _syncSocketOrderRooms() {
@@ -928,6 +1268,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   }
 
   Future<void> _settleOrder(WaiterOrder order) async {
+    _markSelfChange(order.id);
     // A negative id means this order only exists as a local temp record —
     // either this device created it offline and hasn't synced yet, or it
     // arrived from another device via LAN broadcast and was never created
@@ -938,18 +1279,17 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     // until the order lands for real — it already shows the "Not synced"
     // badge as the visible cue why.
     if (order.id < 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
-          ),
-          backgroundColor: Color(0xFFD97706),
-        ),
+      showFloatingResult(
+        context,
+        title: 'Not synced yet',
+        subtitle: 'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+        warning: true,
+        duration: const Duration(milliseconds: 3200),
       );
       return;
     }
 
-    final settlement = await showModalBottomSheet<SettlementData?>(
+    final settlement = await showBlurredBottomSheet<SettlementData?>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
@@ -959,66 +1299,65 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
     if (settlement == null) return;
 
-    setState(() => _isLoading = true);
+    if (!mounted) return;
 
     try {
-      final result = await ApiService.updateWaiterOrderStatus(
-        orderId: order.id,
-        status: 1,
-        paymentMethod: settlement.paymentMethod,
-        discountAmount: settlement.discountAmount,
-        grandTotal: settlement.grandTotal,
-        amountPaid: settlement.amountPaid,
-        paymentRef: settlement.paymentRef,
-        remarks: settlement.remarks,
+      // Loader stays up through the settle call AND the list refresh, so the
+      // settled card is already gone when it closes. (Replaces the old
+      // full-page spinner that blanked the whole cashier screen.)
+      final result = await runWithLoader<Map<String, dynamic>>(
+        context,
+        message: 'Settling order…',
+        task: () async {
+          final r = await ApiService.updateWaiterOrderStatus(
+            orderId: order.id,
+            status: 1,
+            paymentMethod: settlement.paymentMethod,
+            discountAmount: settlement.discountAmount,
+            grandTotal: settlement.grandTotal,
+            amountPaid: settlement.amountPaid,
+            paymentRef: settlement.paymentRef,
+            remarks: settlement.remarks,
+          );
+          if (r['success'] == true) await _loadData(showSpinner: false);
+          return r;
+        },
       );
+      if (!mounted) return;
 
       if (result['success'] == true) {
-        await _loadData(showSpinner: false);
-        // _loadData no-ops (and leaves _isLoading untouched) if a background
-        // poll happens to already be in flight when this call fires — reset
-        // it explicitly rather than depending on that call actually having
-        // run, or this spinner can get stuck forever until the app restarts.
-        if (mounted) {
-          setState(() => _isLoading = false);
-        }
-        if (mounted && _unacknowledgedOrderIds.isEmpty) {
+        // Skip the toast while a new-order alert is on screen so it can't
+        // cover it (same rule the old snackbar followed).
+        if (_unacknowledgedOrderIds.isEmpty) {
           final isOffline = result['is_offline'] == true;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                isOffline
-                    ? 'Order settled locally (Offline). Will auto-sync when online.'
-                    : 'Order settled successfully',
-              ),
-              backgroundColor: isOffline ? const Color(0xFFD97706) : Colors.green,
-            ),
+          showFloatingResult(
+            context,
+            title: 'Order Settled',
+            subtitle: isOffline
+                ? 'Saved offline - will sync when online'
+                : (order.orderNo ?? 'Order #${order.id}'),
+            warning: isOffline,
           );
         }
       } else {
-        setState(() => _isLoading = false);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(result['error'] ?? 'Failed to settle order'), backgroundColor: Colors.red),
-          );
-        }
+        showFloatingError(
+          context,
+          title: 'Order not settled',
+          message: (result['error'] ?? 'Failed to settle order').toString(),
+        );
       }
     } catch (e) {
-      setState(() => _isLoading = false);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: ${e.toString()}'), backgroundColor: Colors.red),
-        );
+        showFloatingError(context, title: 'Order not settled', message: e.toString());
       }
     }
   }
 
   Future<MenuItem?> _showMenuPicker(BuildContext context) async {
-    return showModalBottomSheet<MenuItem>(
+    return showBlurredBottomSheet<MenuItem>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
       builder: (context) => MenuPickerSheet(menuItems: _menuItems),
     );
   }
@@ -1027,11 +1366,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     WaiterOrder order,
     List<EditableOrderItem> editableItems,
   ) async {
-    return showModalBottomSheet<List<EditableOrderItem>>(
+    return showBlurredBottomSheet<List<EditableOrderItem>>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
       builder: (context) {
         return EditOrderBottomSheet(
           title: 'Edit Order',
@@ -1053,14 +1391,14 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   // a rarer, less time-critical action than creating/adding orders, so this
   // intentionally doesn't get its own offline fallback.
   Future<void> _editOrder(WaiterOrder order) async {
+    _markSelfChange(order.id);
     if (order.id < 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
-          ),
-          backgroundColor: Color(0xFFD97706),
-        ),
+      showFloatingResult(
+        context,
+        title: 'Not synced yet',
+        subtitle: 'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+        warning: true,
+        duration: const Duration(milliseconds: 3200),
       );
       return;
     }
@@ -1081,11 +1419,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
     if (_menuItems.isEmpty) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No menu items available to edit this order.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot edit order',
+          message: 'No menu items available to edit this order.',
         );
       }
       return;
@@ -1104,11 +1441,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
     if (editableItems.isEmpty) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No editable items found for this order.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot edit order',
+          message: 'No editable items found for this order.',
         );
       }
       return;
@@ -1119,11 +1455,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     if (updatedItems == null) return;
     if (updatedItems.isEmpty) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Order must have at least one item.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot save order',
+          message: 'Order must have at least one item.',
         );
       }
       return;
@@ -1131,11 +1466,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
     if (updatedItems.any((item) => item.menuId == null)) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Please select a menu for all items.'),
-            backgroundColor: Colors.red,
-          ),
+        showFloatingError(
+          context,
+          title: 'Cannot save order',
+          message: 'Please select a menu for all items.',
         );
       }
       return;
@@ -1150,10 +1484,20 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       };
     }).toList();
 
-    final result = await ApiService.replaceOrderItems(
-      orderId: order.id,
-      items: payload,
+    if (!mounted) return;
+    final result = await runWithLoader<Map<String, dynamic>>(
+      context,
+      message: 'Updating order…',
+      task: () async {
+        final r = await ApiService.replaceOrderItems(
+          orderId: order.id,
+          items: payload,
+        );
+        if (r['success'] == true) await _loadData(showSpinner: false);
+        return r;
+      },
     );
+    if (!mounted) return;
 
     if (result['unauthorized'] == true) {
       await _redirectToLogin();
@@ -1161,18 +1505,17 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     }
 
     if (result['success'] == true) {
-      await _loadData(showSpinner: false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Order updated'), backgroundColor: Colors.green),
-        );
-      }
+      showFloatingResult(
+        context,
+        title: 'Order Updated',
+        subtitle: order.orderNo ?? 'Order #${order.id}',
+      );
     } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(result['error'] ?? 'Failed to update order'), backgroundColor: Colors.red),
-        );
-      }
+      showFloatingError(
+        context,
+        title: 'Order not updated',
+        message: (result['error'] ?? 'Failed to update order').toString(),
+      );
     }
   }
 
@@ -1180,42 +1523,167 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   // (status: -1 instead of 1) — the backend already fully handles it
   // (frees the table, reverses inventory deductions), same as the existing
   // cancel button in the admin web panel.
-  Future<void> _cancelOrder(WaiterOrder order) async {
+  // Extend a room's charge from the cashier's order card — same flow as the
+  // waiter's table card (qty picker -> API -> result dialog).
+  Future<void> _extendRoomCharge(WaiterOrder order) async {
+    _markSelfChange(order.id);
     if (order.id < 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'This order hasn\'t synced to the server yet — please wait a moment and try again.',
-          ),
-          backgroundColor: Color(0xFFD97706),
-        ),
+      showFloatingResult(
+        context,
+        title: 'Not synced yet',
+        subtitle: 'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+        warning: true,
+        duration: const Duration(milliseconds: 3200),
       );
       return;
     }
 
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Cancel order?'),
-        content: Text('Are you sure you want to cancel ${order.orderNo ?? 'order #${order.id}'}?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('No'),
+    // With room-charge history only the room it's in now is adjusted; rooms
+    // it moved out of keep what they were billed.
+    final currentRoom = order.currentRoomCharge;
+    var rate = currentRoom?.rate ?? order.roomCharge;
+    if (rate <= 0) {
+      for (final t in _tables) {
+        if (t.id == order.tableId) {
+          rate = t.roomCharge;
+          break;
+        }
+      }
+    }
+    final tableName = (order.tableNumber ?? '').trim().isEmpty
+        ? 'Room'
+        : order.tableNumber!.trim();
+
+    final sessions = await showRoomChargeAdjust(
+      context,
+      tableName: tableName,
+      orderLabel: order.orderNo ?? '#${order.id}',
+      roomCharge: rate,
+      currentRoomCharge: currentRoom?.amount ?? order.serviceCharge,
+      earlierRoomCharge: currentRoom == null ? 0 : order.roomChargesTotal - currentRoom.amount,
+    );
+    if (sessions == null || !mounted) return;
+
+    final result = await runWithLoader<Map<String, dynamic>>(
+      context,
+      message: 'Updating room charge…',
+      task: () => ApiService.setRoomChargeSessions(orderId: order.id, sessions: sessions),
+    );
+    if (!mounted) return;
+
+    if (result['unauthorized'] == true) {
+      await _redirectToLogin();
+      return;
+    }
+
+    if (result['success'] == true) {
+      final data = result['data'] as Map<String, dynamic>?;
+      final newServiceCharge = (data?['service_charge'] as num?)?.toDouble() ??
+          (order.serviceCharge + rate * sessions - (currentRoom?.amount ?? order.serviceCharge));
+      final added = newServiceCharge - order.serviceCharge;
+      final newTotal = (data?['grand_total'] as num?)?.toDouble() ??
+          (order.grandTotal + added);
+      final units = (data?['room_hours'] as num?)?.toDouble() ?? sessions;
+
+      SystemSound.play(SystemSoundType.alert);
+      HapticFeedback.mediumImpact();
+      await showRoomChargeExtendedResult(
+        context,
+        tableName: tableName,
+        added: added,
+        newRoomCharge: newServiceCharge,
+        newGrandTotal: newTotal,
+        units: units,
+      );
+      if (!mounted) return;
+      await _loadData(showSpinner: false);
+    } else {
+      SystemSound.play(SystemSoundType.alert);
+      await showExtendRoomChargeError(
+        context,
+        result['error']?.toString() ?? 'Failed to update room charge',
+      );
+    }
+  }
+
+  // Take-out: the Switch Menu opens with no table; the order lands in Unsettled
+  // as "Take Out #N" like any other order.
+  Future<void> _openNewTakeOut() async {
+    if (_menuItems.isEmpty) {
+      showFloatingError(
+        context,
+        title: 'Menu not loaded',
+        message: 'Please refresh and try again.',
+      );
+      return;
+    }
+    await openNewTakeOut(context, menuItems: _menuItems, orders: _orders);
+    if (!mounted) return;
+    await _loadData(showSpinner: false);
+  }
+
+  // Take-outs are rare, so this is a quiet outlined button next to the search.
+  Widget _buildTakeOutButton({double height = 50}) {
+    return SizedBox(
+      height: height,
+      child: OutlinedButton.icon(
+        onPressed: _openNewTakeOut,
+        icon: const Icon(Icons.shopping_bag_outlined, size: 18),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: const Color(0xFF0C0E2B),
+          backgroundColor: Colors.white,
+          side: const BorderSide(color: Color(0xFFDDDED3), width: 1.2),
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        ),
+        label: Text(
+          'Take Out',
+          style: GoogleFonts.urbanist(
+            fontSize: 13.5,
+            fontWeight: FontWeight.w800,
           ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Yes, cancel'),
-          ),
-        ],
+        ),
       ),
     );
-    if (confirmed != true) return;
+  }
 
-    final result = await ApiService.updateWaiterOrderStatus(
-      orderId: order.id,
-      status: -1,
+  Future<void> _cancelOrder(WaiterOrder order) async {
+    _markSelfChange(order.id);
+    if (order.id < 0) {
+      showFloatingResult(
+        context,
+        title: 'Not synced yet',
+        subtitle: 'This order hasn\'t synced to the server yet — please wait a moment and try again.',
+        warning: true,
+        duration: const Duration(milliseconds: 3200),
+      );
+      return;
+    }
+
+    final tableText = (order.tableNumber ?? '').trim();
+    final confirmed = await showCancelOrderConfirm(
+      context,
+      orderLabel: order.orderNo ?? 'Order #${order.id}',
+      tableName: tableText.isEmpty
+          ? (order.isTakeOut ? order.takeOutLabel : null)
+          : (tableText.toLowerCase().startsWith('table') ? tableText : 'Table $tableText'),
+    );
+    if (!confirmed) return;
+
+    if (!mounted) return;
+    // Loader stays up through the cancel call AND the list refresh, so the
+    // card doesn't linger on screen after the waiter has confirmed.
+    final result = await runWithLoader<Map<String, dynamic>>(
+      context,
+      message: 'Cancelling order…',
+      task: () async {
+        final r = await ApiService.updateWaiterOrderStatus(
+          orderId: order.id,
+          status: -1,
+        );
+        if (r['success'] == true) await _loadData(showSpinner: false);
+        return r;
+      },
     );
 
     if (result['unauthorized'] == true) {
@@ -1224,20 +1692,23 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     }
 
     if (result['success'] == true) {
-      await _loadData(showSpinner: false);
       if (mounted) {
         final isOffline = result['is_offline'] == true;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(isOffline ? 'Order cancelled locally (Offline). Will auto-sync when online.' : 'Order cancelled'),
-            backgroundColor: isOffline ? const Color(0xFFD97706) : Colors.red,
-          ),
+        showFloatingResult(
+          context,
+          title: 'Order Cancelled',
+          subtitle: isOffline
+              ? 'Saved offline - will sync when online'
+              : (order.orderNo ?? 'Order #${order.id}'),
+          warning: isOffline,
         );
       }
     } else {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(result['error'] ?? 'Failed to cancel order'), backgroundColor: Colors.red),
+        showFloatingError(
+          context,
+          title: 'Order not cancelled',
+          message: (result['error'] ?? 'Failed to cancel order').toString(),
         );
       }
     }
@@ -1293,6 +1764,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
   @override
   Widget build(BuildContext context) {
+    TakeOutNumbers.refresh(_orders);
     if (_isLoading) {
       return Scaffold(
         backgroundColor: const Color(0xFFF5F6F0),
@@ -1338,28 +1810,41 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     final scopedHistoryCount = _filterByFloor(historyOrders).length;
     final totalCollected = _filterByFloor(settledOrders).fold(0.0, (sum, o) => sum + o.grandTotal);
     final screenWidth = MediaQuery.of(context).size.width;
-    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape || screenWidth >= 800;
+    // The one-row header (tabs | stats | take out | search) needs ~1320px with
+    // the three tabs; below that it would squeeze the buttons together, so it
+    // stacks instead.
+    final wideHeader = screenWidth >= 1340;
 
     return DefaultTabController(
-      length: 2,
+      length: 3,
       child: Stack(
         children: [
           Scaffold(
             key: _scaffoldKey,
         backgroundColor: const Color(0xFFF5F6F0),
         appBar: AppBar(
-          title: Text(
-            'cashier_dashboard'.tr,
-            style: GoogleFonts.urbanist(
-              fontWeight: FontWeight.w900,
-              letterSpacing: 2,
-              fontSize: 18,
-              color: const Color(0xFF1A1C18),
+          centerTitle: true,
+          toolbarHeight: 84,
+          // Empty leading as wide as the action buttons so the title block is
+          // truly centered on the screen instead of leaning left.
+          leadingWidth: 176,
+          leading: const SizedBox.shrink(),
+          // BLUE MOON • CASHIER (• GROUND FLOOR / 2nd FLOOR when the account is
+          // floor-scoped). Shrinks on narrow screens instead of overflowing.
+          title: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: QuickMenuBrand(
+              tableLabel: _floorScope == 'gf'
+                  ? 'CASHIER  •  GROUND FLOOR'
+                  : _floorScope == '2f'
+                      ? 'CASHIER  •  2nd FLOOR'
+                      : 'CASHIER',
             ),
           ),
-          backgroundColor: Colors.white,
+          backgroundColor: Colors.transparent,
+          surfaceTintColor: Colors.transparent,
           elevation: 0,
-          scrolledUnderElevation: 2,
+          scrolledUnderElevation: 0,
           actions: [
             ValueListenableBuilder<String?>(
               valueListenable: SoundService.activeAlertTextNotifier,
@@ -1401,14 +1886,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
                     onPressed: () {
                       SoundService.toggleMute();
                       ScaffoldMessenger.of(context).hideCurrentSnackBar();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          behavior: SnackBarBehavior.floating,
-                          duration: const Duration(seconds: 2),
-                          content: Text(
-                            SoundService.isMuted ? 'Notification sounds muted' : 'Notification sounds enabled',
-                          ),
-                        ),
+                      showFloatingResult(
+                        context,
+                        title: SoundService.isMuted ? 'Notification sounds muted' : 'Notification sounds enabled',
+                        warning: SoundService.isMuted,
                       );
                     },
                     icon: Icon(
@@ -1461,114 +1942,41 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
               ),
             ),
           ],
+          // Header block on the cream page: ONE stats card (ready to settle |
+          // collected), the search pill, then the sliding tabs. Wide screens
+          // squeeze it into a single row.
           bottom: PreferredSize(
-            preferredSize: Size.fromHeight(isLandscape ? 58 : 138),
-            child: isLandscape
-                ? Container(
-                    height: 58,
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 7),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      border: Border(
-                        top: BorderSide(color: Colors.grey.withValues(alpha: 0.08)),
-                        bottom: BorderSide(color: Colors.grey.withValues(alpha: 0.12)),
-                      ),
-                    ),
+            preferredSize: Size.fromHeight(wideHeader ? 78 : 216),
+            child: wideHeader
+                ? Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 4, 20, 14),
                     child: Row(
                       children: [
-                        // Navigation Tabs
                         SizedBox(
-                          width: 250,
-                          child: TabBar(
-                            labelColor: const Color(0xFF0C0E2B),
-                            unselectedLabelColor: Colors.grey.shade500,
-                            indicatorColor: const Color(0xFF0C0E2B),
-                            indicatorWeight: 3.5,
-                            indicatorSize: TabBarIndicatorSize.label,
-                            labelStyle: GoogleFonts.urbanist(fontWeight: FontWeight.w900, letterSpacing: 0.8, fontSize: 13),
-                            tabs: [
-                              Tab(
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Text('unsettled'.tr),
-                                    if (scopedUnsettledCount > 0) ...[
-                                      const SizedBox(width: 6),
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF0C0E2B),
-                                          borderRadius: BorderRadius.circular(10),
-                                        ),
-                                        child: Text(
-                                          '$scopedUnsettledCount',
-                                          style: GoogleFonts.urbanist(
-                                            color: Colors.white,
-                                            fontSize: 10.5,
-                                            fontWeight: FontWeight.w900,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                              Tab(
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Text('history'.tr),
-                                    if (scopedHistoryCount > 0) ...[
-                                      const SizedBox(width: 6),
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                                        decoration: BoxDecoration(
-                                          color: Colors.grey.shade200,
-                                          borderRadius: BorderRadius.circular(10),
-                                        ),
-                                        child: Text(
-                                          '$scopedHistoryCount',
-                                          style: GoogleFonts.urbanist(
-                                            color: Colors.grey.shade700,
-                                            fontSize: 10.5,
-                                            fontWeight: FontWeight.w900,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                            ],
+                          width: 460,
+                          child: _CashierTabs(
+                            unsettledCount: scopedUnsettledCount,
+                            historyCount: scopedHistoryCount,
                           ),
                         ),
-                        const SizedBox(width: 14),
-                        Container(height: 26, width: 1.2, color: Colors.grey.shade200),
-                        const SizedBox(width: 14),
-
-                        // Stats pills
-                        _buildLandscapeStatPill(
-                          label: 'READY TO SETTLE',
-                          value: scopedUnsettledCount.toString(),
-                          icon: Icons.assignment_turned_in_rounded,
-                          color: const Color(0xFF0C0E2B),
-                          bgColor: const Color(0xFF0C0E2B).withValues(alpha: 0.07),
-                        ),
-                        const SizedBox(width: 10),
-                        _buildLandscapeStatPill(
-                          label: 'COLLECTED',
-                          value: '₱${formatPrice(totalCollected)}',
-                          icon: Icons.account_balance_wallet_rounded,
-                          color: const Color(0xFF059669),
-                          bgColor: const Color(0xFF059669).withValues(alpha: 0.08),
-                        ),
-
-                        const Spacer(),
-
-                        // Search
+                        const SizedBox(width: 16),
                         SizedBox(
-                          width: screenWidth > 1150 ? 300 : 230,
-                          height: 38,
+                          width: 400,
+                          child: _buildStatsCard(
+                            unsettled: scopedUnsettledCount,
+                            collected: totalCollected,
+                            compact: true,
+                          ),
+                        ),
+                        const Spacer(),
+                        if (_floorScope != '2f') ...[
+                          const SizedBox(width: 16),
+                          _buildTakeOutButton(height: 48),
+                        ],
+                        const SizedBox(width: 12),
+                        SizedBox(
+                          width: screenWidth >= 1450 ? 300 : 250,
+                          height: 48,
                           child: _buildSearchTextField(isCompact: true),
                         ),
                       ],
@@ -1578,45 +1986,35 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 6),
+                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                        child: _buildStatsCard(
+                          unsettled: scopedUnsettledCount,
+                          collected: totalCollected,
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
                         child: Row(
                           children: [
-                            _buildQuickStat(
-                              label: 'ready_to_settle'.tr,
-                              value: scopedUnsettledCount.toString(),
-                              icon: Icons.assignment_turned_in_rounded,
-                              color: const Color(0xFF0C0E2B),
-                              isCompact: true,
+                            Expanded(
+                              child: SizedBox(
+                                height: 50,
+                                child: _buildSearchTextField(),
+                              ),
                             ),
-                            const SizedBox(width: 10),
-                            _buildQuickStat(
-                              label: 'collected'.tr,
-                              value: '₱${formatPrice(totalCollected)}',
-                              icon: Icons.account_balance_wallet_rounded,
-                              color: const Color(0xFF059669),
-                              isCompact: true,
-                            ),
+                            if (_floorScope != '2f') ...[
+                              const SizedBox(width: 10),
+                              _buildTakeOutButton(),
+                            ],
                           ],
                         ),
                       ),
                       Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-                        child: SizedBox(
-                          height: 38,
-                          child: _buildSearchTextField(isCompact: true),
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                        child: _CashierTabs(
+                          unsettledCount: scopedUnsettledCount,
+                          historyCount: scopedHistoryCount,
                         ),
-                      ),
-                      TabBar(
-                        labelColor: const Color(0xFF0C0E2B),
-                        unselectedLabelColor: Colors.grey,
-                        indicatorColor: const Color(0xFF0C0E2B),
-                        indicatorWeight: 3.5,
-                        indicatorSize: TabBarIndicatorSize.label,
-                        labelStyle: GoogleFonts.urbanist(fontWeight: FontWeight.w900, letterSpacing: 1, fontSize: 13),
-                        tabs: [
-                          Tab(text: 'unsettled'.tr),
-                          Tab(text: 'history'.tr),
-                        ],
                       ),
                     ],
                   ),
@@ -1640,6 +2038,12 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
                   children: [
                     _buildOrderList(_filterAndSortOrders(unsettledOrders), isHistory: false),
                     _buildOrderList(_filterOrders(historyOrders), isHistory: true),
+                    ActivityLogView(
+                      searchQuery: _searchQuery,
+                      floorScope: _floorScope,
+                      isGroundFloor: _isGroundFloorFor,
+                      refreshSignal: _activitySignal,
+                    ),
                   ],
                 ),
               ),
@@ -1657,7 +2061,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
             return _CenterOrderAlertModal(
               orders: ordersToDisplay,
-              isAddedItems: _alertIsAddedItems,
+              alertInfo: Map.unmodifiable(_alertInfo),
               onAcknowledgeSingle: (orderId) => _acknowledgeOrder(orderId),
               onAcknowledgeAll: () => _acknowledgeAllOrders(),
             );
@@ -1668,49 +2072,110 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 );
   }
 
-  Widget _buildLandscapeStatPill({
-    required String label,
-    required String value,
-    required IconData icon,
-    required Color color,
-    required Color bgColor,
+  // One white card, two halves: Ready to settle | Collected. Cleaner than two
+  // separate boxes; the pending count turns amber when there is work to do.
+  Widget _buildStatsCard({
+    required int unsettled,
+    required double collected,
+    bool compact = false,
   }) {
+    const navy = Color(0xFF0C0E2B);
+    const amber = Color(0xFFD97706);
+    const green = Color(0xFF059669);
+
+    Widget half({
+      required String label,
+      required String value,
+      required IconData icon,
+      required Color color,
+    }) {
+      return Expanded(
+        child: Row(
+          children: [
+            Container(
+              width: compact ? 34 : 44,
+              height: compact ? 34 : 44,
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.12),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, color: color, size: compact ? 18 : 23),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      style: GoogleFonts.urbanist(
+                        fontSize: compact ? 10 : 11.5,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.8,
+                        color: Colors.grey.shade600,
+                      ),
+                    ),
+                  ),
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      value,
+                      style: GoogleFonts.urbanist(
+                        fontSize: compact ? 20 : 27,
+                        fontWeight: FontWeight.w900,
+                        color: color,
+                        height: 1.1,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+      height: compact ? 56 : 78,
+      padding: EdgeInsets.symmetric(horizontal: compact ? 12 : 16),
       decoration: BoxDecoration(
-        color: bgColor,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withValues(alpha: 0.18), width: 1),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(compact ? 16 : 22),
+        border: Border.all(color: const Color(0xFFDDDED3)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.05),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
       ),
       child: Row(
-        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, color: color, size: 15),
-          const SizedBox(width: 7),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisAlignment: MainAxisAlignment.center,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                label,
-                style: GoogleFonts.urbanist(
-                  fontSize: 8.5,
-                  fontWeight: FontWeight.w800,
-                  color: color.withValues(alpha: 0.75),
-                  letterSpacing: 0.5,
-                ),
-              ),
-              Text(
-                value,
-                style: GoogleFonts.urbanist(
-                  fontSize: 13.5,
-                  fontWeight: FontWeight.w900,
-                  color: color,
-                  height: 1.1,
-                ),
-              ),
-            ],
+          half(
+            label: 'READY TO SETTLE',
+            value: '$unsettled',
+            icon: Icons.assignment_turned_in_rounded,
+            color: unsettled > 0 ? amber : navy,
+          ),
+          Container(
+            width: 1.2,
+            height: compact ? 30 : 44,
+            margin: const EdgeInsets.symmetric(horizontal: 12),
+            color: const Color(0xFFDDDED3),
+          ),
+          half(
+            label: 'COLLECTED',
+            value: '₱${formatPrice(collected)}',
+            icon: Icons.account_balance_wallet_rounded,
+            color: green,
           ),
         ],
       ),
@@ -1775,81 +2240,6 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     );
   }
 
-  Widget _buildQuickStat({
-    required String label,
-    required String value,
-    required IconData icon,
-    required Color color,
-    bool isCompact = false,
-  }) {
-    return Expanded(
-      child: Container(
-        padding: EdgeInsets.symmetric(
-          vertical: isCompact ? 6 : 10,
-          horizontal: isCompact ? 12 : 16,
-        ),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(isCompact ? 14 : 24),
-          border: Border.all(color: Colors.grey.withOpacity(0.08), width: 1.5),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.04),
-              blurRadius: 12,
-              offset: const Offset(0, 4),
-            ),
-          ],
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.start,
-          children: [
-            Container(
-              padding: EdgeInsets.all(isCompact ? 6 : 8),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [color.withOpacity(0.15), color.withOpacity(0.08)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(icon, color: color, size: isCompact ? 18 : 24),
-            ),
-            SizedBox(width: isCompact ? 8 : 10),
-            Flexible(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    label,
-                    style: GoogleFonts.urbanist(
-                      fontSize: isCompact ? 10 : 11,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.grey.shade600,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                  FittedBox(
-                    fit: BoxFit.scaleDown,
-                    child: Text(
-                      value,
-                      style: GoogleFonts.urbanist(
-                        fontSize: isCompact ? 16 : 22,
-                        fontWeight: FontWeight.w900,
-                        color: color,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildOrderList(List<WaiterOrder> orders, {required bool isHistory}) {
     if (orders.isEmpty) {
       return Center(
@@ -1874,11 +2264,21 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
     if (isHistory) {
       return ListView.builder(
-        padding: const EdgeInsets.fromLTRB(24, 24, 24, 100),
-        itemCount: orders.length,
+        padding: const EdgeInsets.fromLTRB(24, 20, 24, 100),
+        itemCount: orders.length + 1,
         itemBuilder: (context, index) {
+          if (index == 0) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 18),
+              child: CenteredSectionHeader(
+                title: 'Settled & Cancelled',
+                subtitle: '${orders.length} order(s)',
+              ),
+            );
+          }
           return _HistoryOrderListItem(
-            order: orders[index],
+            order: orders[index - 1],
+            isGroundFloor: _isGroundFloorOrder(orders[index - 1]),
           );
         },
       );
@@ -1942,6 +2342,8 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
                     onSettle: () => _settleOrder(order),
                     onEdit: () => _editOrder(order),
                     onCancel: () => _cancelOrder(order),
+                    onExtendRoomCharge: () => _extendRoomCharge(order),
+                    onSelfChange: () => _markSelfChange(order.id),
                     isPinned: _pinnedOrderIds.contains(order.id),
                     onPin: () => _togglePinOrder(order.id),
                     onRefresh: () => _loadData(showSpinner: false),
@@ -2050,8 +2452,9 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
 
 class _HistoryOrderListItem extends StatefulWidget {
   final WaiterOrder order;
+  final bool isGroundFloor;
 
-  const _HistoryOrderListItem({required this.order});
+  const _HistoryOrderListItem({required this.order, required this.isGroundFloor});
 
   @override
   State<_HistoryOrderListItem> createState() => _HistoryOrderListItemState();
@@ -2083,14 +2486,15 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
     const emeraldColor = Color(0xFF059669);
     final order = widget.order;
     final isCancelled = order.status == -1;
-    final statusColor = isCancelled ? Colors.red.shade700 : emeraldColor;
+    // Bright status color for the navy header.
+    final statusBright = isCancelled ? const Color(0xFFFF6B6B) : const Color(0xFF4ADE80);
     final isCash = (order.paymentMethod ?? 'CASH').toUpperCase() == 'CASH';
     final effectivePaid = order.amountPaid > 0 ? order.amountPaid : order.grandTotal;
     final changeAmount = (effectivePaid - order.grandTotal).clamp(0.0, double.infinity);
 
     final rawTableName = (order.tableNumber ?? '').trim();
     final tableDisplay = rawTableName.isEmpty
-        ? 'Dine-In'
+        ? (order.isTakeOut ? order.takeOutLabel : 'Dine-In')
         : (rawTableName.toLowerCase().startsWith('table') ? rawTableName : 'Table $rawTableName');
 
     final items = order.items;
@@ -2119,18 +2523,26 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // 1. TOP HEADER
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+          Container(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(17)),
+            ),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
                 Container(
                   padding: const EdgeInsets.all(9),
                   decoration: BoxDecoration(
-                    color: emeraldColor.withValues(alpha: 0.12),
+                    color: statusBright.withValues(alpha: 0.18),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Icon(Icons.receipt_long_rounded, color: emeraldColor, size: 20),
+                  child: Icon(Icons.receipt_long_rounded, color: statusBright, size: 22),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -2145,29 +2557,30 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
                               style: GoogleFonts.urbanist(
                                 fontSize: 16,
                                 fontWeight: FontWeight.w900,
-                                color: const Color(0xFF0F172A),
+                                color: Colors.white,
                               ),
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
                           const SizedBox(width: 8),
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
                             decoration: BoxDecoration(
-                              color: statusColor.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(6),
+                              color: statusBright.withValues(alpha: 0.18),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(color: statusBright.withValues(alpha: 0.6)),
                             ),
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                Icon(isCancelled ? Icons.cancel_rounded : Icons.check_circle_rounded, size: 11, color: statusColor),
+                                Icon(isCancelled ? Icons.cancel_rounded : Icons.check_circle_rounded, size: 13, color: statusBright),
                                 const SizedBox(width: 4),
                                 Text(
                                   isCancelled ? 'CANCELLED' : 'SETTLED',
                                   style: GoogleFonts.urbanist(
-                                    fontSize: 9.5,
+                                    fontSize: 11,
                                     fontWeight: FontWeight.w900,
-                                    color: statusColor,
+                                    color: statusBright,
                                     letterSpacing: 0.5,
                                   ),
                                 ),
@@ -2181,14 +2594,14 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
                       const SizedBox(height: 3),
                       Row(
                         children: [
-                          Icon(Icons.schedule_rounded, size: 13, color: Colors.grey.shade500),
+                          const Icon(Icons.schedule_rounded, size: 14, color: Colors.white54),
                           const SizedBox(width: 5),
                           Text(
                             _formatOrderDateTime(order.encodedDt, order.orderNo),
                             style: GoogleFonts.urbanist(
-                              fontSize: 12,
+                              fontSize: 13,
                               fontWeight: FontWeight.w700,
-                              color: Colors.grey.shade600,
+                              color: Colors.white70,
                             ),
                           ),
                         ],
@@ -2204,20 +2617,21 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
                       decoration: BoxDecoration(
-                        color: primaryColor.withValues(alpha: 0.08),
-                        borderRadius: BorderRadius.circular(8),
+                        color: const Color(0xFFE8C468).withValues(alpha: 0.16),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFFE8C468).withValues(alpha: 0.5)),
                       ),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          const Icon(Icons.chair_alt_rounded, size: 13, color: primaryColor),
+                          const Icon(Icons.chair_alt_rounded, size: 15, color: Color(0xFFE8C468)),
                           const SizedBox(width: 5),
                           Text(
                             tableDisplay,
                             style: GoogleFonts.urbanist(
-                              fontSize: 12,
+                              fontSize: 14,
                               fontWeight: FontWeight.w900,
-                              color: primaryColor,
+                              color: const Color(0xFFE8C468),
                             ),
                           ),
                         ],
@@ -2228,9 +2642,9 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
                       Text(
                         order.orderType!.toUpperCase(),
                         style: GoogleFonts.urbanist(
-                          fontSize: 10,
+                          fontSize: 11,
                           fontWeight: FontWeight.w800,
-                          color: Colors.grey.shade500,
+                          color: Colors.white54,
                           letterSpacing: 0.5,
                         ),
                       ),
@@ -2583,15 +2997,17 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
                     else
                       const SizedBox.shrink(),
 
-                    // View Receipt button
+                    // Full breakdown + payment details of the settled order
                     SizedBox(
                       height: 34,
                       child: OutlinedButton.icon(
                         onPressed: () {
-                          BillOutModal.show(
+                          OrderDetailsSheet.show(
                             context,
                             order: order,
-                            onSettle: () {},
+                            roomChargeRate: order.roomCharge,
+                            floorLabel: widget.isGroundFloor ? 'GF' : '2F',
+                            isHistory: true,
                           );
                         },
                         style: OutlinedButton.styleFrom(
@@ -2602,7 +3018,7 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
                         ),
                         icon: const Icon(Icons.receipt_long_rounded, size: 14),
                         label: Text(
-                          'View Statement / Receipt',
+                          'View Details',
                           style: GoogleFonts.urbanist(fontSize: 12, fontWeight: FontWeight.w800),
                         ),
                       ),
@@ -2618,15 +3034,87 @@ class _HistoryOrderListItemState extends State<_HistoryOrderListItem> {
   }
 }
 
+/// Why an order is in the cashier's alert queue.
+enum _AlertKind { newOrder, itemsAdded, itemsEdited, cancelled, roomCharge, transferred }
+
+/// What changed on an order the cashier already had (an order with no entry
+/// in the alert map is a brand-new order).
+class _OrderAlertInfo {
+  final _AlertKind kind;
+  final List<WaiterOrderItem> added;
+  final List<WaiterOrderItem> removed;
+  final double? roomChargeFrom;
+  final double? roomChargeTo;
+  final String? fromTable;
+  final String? toTable;
+
+  /// Username of who made the change — from the socket event; null when the
+  /// REST poll found it (the poll can't tell who).
+  final String? byName;
+
+  const _OrderAlertInfo(
+    this.kind, {
+    this.added = const [],
+    this.removed = const [],
+    this.roomChargeFrom,
+    this.roomChargeTo,
+    this.fromTable,
+    this.toTable,
+    this.byName,
+  });
+
+  /// Several changes before the cashier acknowledges add up into one notice;
+  /// a cancel always wins.
+  _OrderAlertInfo mergedWith(_OrderAlertInfo next) {
+    if (next.kind == _AlertKind.cancelled || kind == _AlertKind.cancelled) return next;
+    const itemKinds = {_AlertKind.itemsAdded, _AlertKind.itemsEdited};
+    if (itemKinds.contains(kind) && itemKinds.contains(next.kind)) {
+      final onlyAdded = kind == _AlertKind.itemsAdded && next.kind == _AlertKind.itemsAdded;
+      return _OrderAlertInfo(
+        onlyAdded ? _AlertKind.itemsAdded : _AlertKind.itemsEdited,
+        added: WaiterOrder.consolidateItems([...added, ...next.added]),
+        removed: WaiterOrder.consolidateItems([...removed, ...next.removed]),
+        byName: next.byName ?? byName,
+      );
+    }
+    if (kind == _AlertKind.transferred && next.kind == _AlertKind.transferred) {
+      return _OrderAlertInfo(
+        _AlertKind.transferred,
+        fromTable: fromTable ?? next.fromTable,
+        toTable: next.toTable,
+        byName: next.byName ?? byName,
+      );
+    }
+    if (kind == _AlertKind.roomCharge && next.kind == _AlertKind.roomCharge) {
+      return _OrderAlertInfo(
+        _AlertKind.roomCharge,
+        roomChargeFrom: roomChargeFrom ?? next.roomChargeFrom,
+        roomChargeTo: next.roomChargeTo,
+        byName: next.byName ?? byName,
+      );
+    }
+    return next;
+  }
+}
+
+/// One line in an alert: ordered (0), added (+1) or removed (-1).
+class _AlertLine {
+  final WaiterOrderItem item;
+  final int sign;
+  const _AlertLine(this.item, [this.sign = 0]);
+}
+
 class _CenterOrderAlertModal extends StatefulWidget {
   final List<WaiterOrder> orders;
-  final bool isAddedItems;
+
+  /// Why each order is shown; an order missing here is a brand-new order.
+  final Map<int, _OrderAlertInfo> alertInfo;
   final void Function(int orderId) onAcknowledgeSingle;
   final VoidCallback onAcknowledgeAll;
 
   const _CenterOrderAlertModal({
     required this.orders,
-    this.isAddedItems = false,
+    this.alertInfo = const {},
     required this.onAcknowledgeSingle,
     required this.onAcknowledgeAll,
   });
@@ -2641,6 +3129,10 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
   static const secondaryColor = Color(0xFF1B1E4A);
   static const goldAccent = Color(0xFFFBBF24);
   static const amberAccent = Color(0xFFD97706);
+  static const _green = Color(0xFF16A34A);
+  static const _red = Color(0xFFDC2626);
+  static const _blue = Color(0xFF2563EB);
+  static const _ink = Color(0xFF1E293B);
 
   late final AnimationController _bellController;
   late final Animation<double> _bellAnimation;
@@ -2678,13 +3170,460 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
     return 'Table $clean';
   }
 
+  static String _fmtQty(double v) => v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(1);
+
+  // ── what each order's notice says ─────────────────────────────────────────
+
+  _OrderAlertInfo? _infoOf(WaiterOrder o) => widget.alertInfo[o.id];
+
+  _AlertKind _kindOf(WaiterOrder o) => _infoOf(o)?.kind ?? _AlertKind.newOrder;
+
+  /// "Items added" where we couldn't tell which items: show the whole order.
+  bool _addedUnknown(WaiterOrder o) =>
+      _kindOf(o) == _AlertKind.itemsAdded && (_infoOf(o)?.added.isEmpty ?? true);
+
+  List<_AlertLine> _linesFor(WaiterOrder order) {
+    final info = _infoOf(order);
+    switch (_kindOf(order)) {
+      case _AlertKind.itemsAdded:
+        if (_addedUnknown(order)) return [for (final i in order.items) _AlertLine(i)];
+        return [for (final i in info!.added) _AlertLine(i, 1)];
+      case _AlertKind.itemsEdited:
+        return [
+          for (final i in info!.added) _AlertLine(i, 1),
+          for (final i in info.removed) _AlertLine(i, -1),
+        ];
+      case _AlertKind.roomCharge:
+      case _AlertKind.transferred:
+        return const [];
+      case _AlertKind.newOrder:
+      case _AlertKind.cancelled:
+        return [for (final i in order.items) _AlertLine(i)];
+    }
+  }
+
+  bool _showsRoomRow(WaiterOrder order) {
+    final kind = _kindOf(order);
+    return (kind == _AlertKind.newOrder || kind == _AlertKind.cancelled || _addedUnknown(order)) &&
+        order.serviceCharge > 0;
+  }
+
+  bool _isWaived(WaiterOrder order) => (_infoOf(order)?.roomChargeTo ?? 1) <= 0.005;
+
+  String _singleTitle(WaiterOrder order) {
+    switch (_kindOf(order)) {
+      case _AlertKind.newOrder:
+        return 'NEW ORDER RECEIVED!';
+      case _AlertKind.itemsAdded:
+        return _addedUnknown(order) ? 'ORDER UPDATED' : 'ITEMS ADDED';
+      case _AlertKind.itemsEdited:
+        return 'ORDER EDITED';
+      case _AlertKind.cancelled:
+        return 'ORDER CANCELLED';
+      case _AlertKind.roomCharge:
+        return _isWaived(order) ? 'ROOM CHARGE WAIVED' : 'ROOM CHARGE UPDATED';
+      case _AlertKind.transferred:
+        return 'TABLE TRANSFERRED';
+    }
+  }
+
+  String _sectionLabel(WaiterOrder order) {
+    switch (_kindOf(order)) {
+      case _AlertKind.newOrder:
+        return 'ORDER ITEMS';
+      case _AlertKind.itemsAdded:
+        return _addedUnknown(order) ? 'ORDER ITEMS' : 'NEWLY ADDED ITEMS';
+      case _AlertKind.itemsEdited:
+        return 'CHANGES';
+      case _AlertKind.cancelled:
+        return 'CANCELLED ORDER';
+      case _AlertKind.roomCharge:
+        return 'ROOM CHARGE';
+      case _AlertKind.transferred:
+        return 'TABLE TRANSFER';
+    }
+  }
+
+  /// Small tag next to the table name in the multi-order list.
+  (String, Color) _kindTag(WaiterOrder order) {
+    switch (_kindOf(order)) {
+      case _AlertKind.newOrder:
+        return ('NEW', amberAccent);
+      case _AlertKind.itemsAdded:
+        return ('+ ADDED', _blue);
+      case _AlertKind.itemsEdited:
+        return ('EDITED', _blue);
+      case _AlertKind.cancelled:
+        return ('CANCELLED', _red);
+      case _AlertKind.roomCharge:
+        return (_isWaived(order) ? 'ROOM WAIVED' : 'ROOM CHARGE', amberAccent);
+      case _AlertKind.transferred:
+        return ('MOVED', _blue);
+    }
+  }
+
+  String _countLabel(WaiterOrder order) {
+    final info = _infoOf(order);
+    switch (_kindOf(order)) {
+      case _AlertKind.itemsAdded:
+        if (!_addedUnknown(order)) {
+          final qty = info!.added.fold<double>(0, (s, i) => s + i.quantity);
+          return '+${_fmtQty(qty)} added';
+        }
+        break;
+      case _AlertKind.itemsEdited:
+        final plus = info!.added.fold<double>(0, (s, i) => s + i.quantity);
+        final minus = info.removed.fold<double>(0, (s, i) => s + i.quantity);
+        return [
+          if (plus > 0) '+${_fmtQty(plus)}',
+          if (minus > 0) '−${_fmtQty(minus)}',
+        ].join(' / ');
+      case _AlertKind.roomCharge:
+        return 'Room';
+      case _AlertKind.newOrder:
+      case _AlertKind.cancelled:
+      case _AlertKind.transferred:
+        break;
+    }
+    final n = order.items.length;
+    return order.serviceCharge > 0 ? '$n items + Room' : '$n items';
+  }
+
+  /// (label, amount, colour, struck-through) for the notice's total line.
+  (String, double, Color, bool) _totalFor(WaiterOrder order) {
+    final info = _infoOf(order);
+    switch (_kindOf(order)) {
+      case _AlertKind.newOrder:
+        return ('TOTAL DUE', order.grandTotal, amberAccent, false);
+      case _AlertKind.itemsAdded:
+        if (!_addedUnknown(order)) {
+          final sum = info!.added.fold<double>(0, (s, i) => s + i.lineTotal);
+          return ('ADDED', sum, _green, false);
+        }
+        return ('NEW TOTAL DUE', order.grandTotal, amberAccent, false);
+      case _AlertKind.itemsEdited:
+      case _AlertKind.roomCharge:
+        return ('NEW TOTAL DUE', order.grandTotal, amberAccent, false);
+      case _AlertKind.transferred:
+        return ('TOTAL DUE', order.grandTotal, amberAccent, false);
+      case _AlertKind.cancelled:
+        return ('CANCELLED', order.grandTotal, _red, true);
+    }
+  }
+
+  /// "Edited by gf_waiter2", "Cancelled — no payment needed", … or null.
+  (String, Color, IconData)? _bannerFor(WaiterOrder order) {
+    final info = _infoOf(order);
+    final by = info?.byName;
+    final byText = by == null || by.isEmpty ? '' : ' by $by';
+    switch (_kindOf(order)) {
+      case _AlertKind.newOrder:
+        return null;
+      case _AlertKind.itemsAdded:
+        return byText.isEmpty ? null : ('Items added$byText', _blue, Icons.add_circle_outline_rounded);
+      case _AlertKind.itemsEdited:
+        return ('Order edited$byText', _blue, Icons.edit_note_rounded);
+      case _AlertKind.cancelled:
+        return ('Cancelled$byText — no payment needed', _red, Icons.cancel_outlined);
+      case _AlertKind.roomCharge:
+        return (
+          _isWaived(order) ? 'Room charge waived$byText' : 'Room charge changed$byText',
+          amberAccent,
+          Icons.more_time_rounded,
+        );
+      case _AlertKind.transferred:
+        return ('Moved to another table$byText', _blue, Icons.swap_horiz_rounded);
+    }
+  }
+
+  /// From → to for a table transfer.
+  Widget _tableMove(WaiterOrder order, {required bool compact}) {
+    final info = _infoOf(order)!;
+    final from = (info.fromTable ?? '').trim();
+    final to = (info.toTable ?? order.tableNumber ?? '').trim();
+    final fontSize = compact ? 12.5 : 15.0;
+    Widget name(String text, {required bool current}) => Flexible(
+          child: Text(
+            text.isEmpty ? '—' : _formatTableForDisplay(text, order.orderType),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: GoogleFonts.urbanist(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w900,
+              color: current ? primaryColor : Colors.grey.shade500,
+              decoration: current ? null : TextDecoration.lineThrough,
+              decorationColor: Colors.grey.shade500,
+            ),
+          ),
+        );
+    return Padding(
+      padding: EdgeInsets.symmetric(vertical: compact ? 2 : 6),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          name(from, current: false),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Icon(Icons.arrow_forward_rounded, size: compact ? 16 : 20, color: _blue),
+          ),
+          name(to, current: true),
+        ],
+      ),
+    );
+  }
+
+  // ── building blocks ──────────────────────────────────────────────────────
+
+  Widget _tag(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Text(
+        label,
+        style: GoogleFonts.urbanist(
+          color: color,
+          fontSize: 9.5,
+          fontWeight: FontWeight.w900,
+          letterSpacing: 0.4,
+        ),
+      ),
+    );
+  }
+
+  Widget _banner(WaiterOrder order, {required bool compact}) {
+    final banner = _bannerFor(order);
+    if (banner == null) return const SizedBox.shrink();
+    final (text, color, icon) = banner;
+    return Container(
+      width: double.infinity,
+      margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+      padding: EdgeInsets.symmetric(horizontal: 10, vertical: compact ? 5 : 7),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: compact ? 13 : 15, color: color),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: GoogleFonts.urbanist(
+                fontSize: compact ? 10.5 : 11.5,
+                fontWeight: FontWeight.w800,
+                color: color,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _lineRow(_AlertLine line, {required bool compact}) {
+    final item = line.item;
+    final added = line.sign > 0;
+    final removed = line.sign < 0;
+    final badgeColor = added ? _green : (removed ? _red : primaryColor);
+    final badge = added
+        ? '+${_fmtQty(item.quantity)}'
+        : (removed ? '−${_fmtQty(item.quantity)}' : '${_fmtQty(item.quantity)}x');
+    final fontSize = compact ? 11.0 : 12.0;
+    final remarks = (item.remarks ?? '').trim();
+    return Padding(
+      padding: EdgeInsets.symmetric(vertical: compact ? 2 : 3),
+      child: Row(
+        children: [
+          Container(
+            padding: EdgeInsets.symmetric(horizontal: compact ? 5 : 6, vertical: compact ? 1 : 2),
+            decoration: BoxDecoration(
+              color: badgeColor.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              badge,
+              style: GoogleFonts.urbanist(
+                fontSize: fontSize - 1,
+                fontWeight: FontWeight.w900,
+                color: badgeColor,
+              ),
+            ),
+          ),
+          SizedBox(width: compact ? 6 : 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  item.name,
+                  maxLines: compact ? 1 : 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.urbanist(
+                    fontSize: fontSize,
+                    fontWeight: FontWeight.w700,
+                    color: removed ? Colors.grey.shade500 : _ink,
+                    decoration: removed ? TextDecoration.lineThrough : null,
+                    decorationColor: Colors.grey.shade500,
+                  ),
+                ),
+                if (!compact && remarks.isNotEmpty)
+                  Text(
+                    remarks,
+                    style: GoogleFonts.urbanist(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.grey.shade500,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          SizedBox(width: compact ? 6 : 8),
+          Text(
+            removed ? '−₱${formatPrice(item.lineTotal)}' : '₱${formatPrice(item.lineTotal)}',
+            style: GoogleFonts.urbanist(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w800,
+              color: removed ? _red : (added ? _green : const Color(0xFF0D9488)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _roomRow(WaiterOrder order, {required bool compact}) {
+    return Padding(
+      padding: EdgeInsets.symmetric(vertical: compact ? 2 : 3),
+      child: Row(
+        children: [
+          Container(
+            padding: EdgeInsets.symmetric(horizontal: compact ? 4 : 5, vertical: compact ? 1 : 2),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFEF3C7),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              'ROOM',
+              style: GoogleFonts.urbanist(
+                fontSize: compact ? 8 : 9,
+                fontWeight: FontWeight.w900,
+                color: amberAccent,
+              ),
+            ),
+          ),
+          SizedBox(width: compact ? 6 : 8),
+          Expanded(
+            child: Text(
+              'Room Charge',
+              style: GoogleFonts.urbanist(
+                fontSize: compact ? 11 : 12,
+                fontWeight: FontWeight.w700,
+                color: _ink,
+              ),
+            ),
+          ),
+          SizedBox(width: compact ? 6 : 8),
+          Text(
+            '₱${formatPrice(order.serviceCharge)}',
+            style: GoogleFonts.urbanist(
+              fontSize: compact ? 11 : 12,
+              fontWeight: FontWeight.w800,
+              color: amberAccent,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Before → now for a room-charge change.
+  Widget _roomChange(WaiterOrder order, {required bool compact}) {
+    final info = _infoOf(order)!;
+    final from = info.roomChargeFrom ?? 0;
+    final to = info.roomChargeTo ?? order.serviceCharge;
+    final fontSize = compact ? 11.5 : 13.0;
+    Widget row(String label, Widget value) => Padding(
+          padding: EdgeInsets.symmetric(vertical: compact ? 2 : 4),
+          child: Row(
+            children: [
+              Text(
+                label,
+                style: GoogleFonts.urbanist(
+                  fontSize: fontSize,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.grey.shade600,
+                ),
+              ),
+              const Spacer(),
+              value,
+            ],
+          ),
+        );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        row(
+          'Before',
+          Text(
+            '₱${formatPrice(from)}',
+            style: GoogleFonts.urbanist(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w800,
+              color: Colors.grey.shade500,
+              decoration: TextDecoration.lineThrough,
+              decorationColor: Colors.grey.shade500,
+            ),
+          ),
+        ),
+        row(
+          'Now',
+          Text(
+            to <= 0.005 ? 'Waived · ₱0.00' : '₱${formatPrice(to)}',
+            style: GoogleFonts.urbanist(
+              fontSize: fontSize + 1,
+              fontWeight: FontWeight.w900,
+              color: to <= 0.005 ? _green : amberAccent,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isMulti = widget.orders.length > 1;
+    final String title;
+    if (isMulti) {
+      final n = widget.orders.length;
+      final newCount = widget.orders.where((o) => _kindOf(o) == _AlertKind.newOrder).length;
+      title = newCount == n
+          ? '$n NEW ORDERS RECEIVED!'
+          : (newCount == 0 ? '$n ORDERS UPDATED' : '$n ORDER ALERTS');
+    } else {
+      title = _singleTitle(widget.orders.first);
+    }
 
     return Material(
-      color: Colors.black.withValues(alpha: 0.6),
-      child: Center(
+      type: MaterialType.transparency,
+      child: Stack(
+        children: [
+          // Blurred, dimmed screen behind the alert, like the app's other popups.
+          Positioned.fill(
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+              child: ColoredBox(color: Colors.black.withValues(alpha: 0.4)),
+            ),
+          ),
+          Center(
         child: Container(
           width: isMulti ? 440 : 390,
           constraints: BoxConstraints(
@@ -2725,7 +3664,6 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
                 ),
                 child: Row(
                   children: [
-                    // Animated Ringing Bell Badge
                     Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
@@ -2754,9 +3692,7 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            isMulti
-                                ? '${widget.orders.length} NEW ORDERS RECEIVED!'
-                                : (widget.isAddedItems ? 'ORDER UPDATED' : 'NEW ORDER RECEIVED!'),
+                            title,
                             style: GoogleFonts.urbanist(
                               color: goldAccent,
                               fontWeight: FontWeight.w900,
@@ -2813,17 +3749,19 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
           ),
         ),
       ),
+        ],
+      ),
     );
   }
 
   // --- SINGLE ORDER VIEW ---
-  Widget _buildSingleOrderView(
-    BuildContext context,
-    WaiterOrder order,
-  ) {
-    final tableDisplay = _formatTableForDisplay(order.tableNumber, order.orderType);
-    final totalStr = formatPrice(order.grandTotal);
-    final items = order.items;
+  Widget _buildSingleOrderView(BuildContext context, WaiterOrder order) {
+    final tableDisplay = order.isTakeOut ? order.takeOutLabel : _formatTableForDisplay(order.tableNumber, order.orderType);
+    final kind = _kindOf(order);
+    final lines = _linesFor(order);
+    final showRoom = _showsRoomRow(order);
+    final (totalLabel, totalAmount, totalColor, struck) = _totalFor(order);
+    final showNewTotal = kind == _AlertKind.itemsAdded && !_addedUnknown(order);
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -2867,15 +3805,16 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
           ),
         ),
         const SizedBox(height: 10),
+        _banner(order, compact: false),
 
-        // Section Header: Order Items
+        // Section header
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 2),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                'ORDER ITEMS',
+                _sectionLabel(order),
                 style: GoogleFonts.urbanist(
                   fontSize: 11,
                   fontWeight: FontWeight.w800,
@@ -2890,7 +3829,7 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: Text(
-                  order.serviceCharge > 0 ? '${items.length} items + Room' : '${items.length} items',
+                  _countLabel(order),
                   style: GoogleFonts.urbanist(
                     fontSize: 10,
                     fontWeight: FontWeight.w700,
@@ -2903,7 +3842,7 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
         ),
         const SizedBox(height: 6),
 
-        // Order Items List
+        // Lines
         Flexible(
           child: Container(
             constraints: const BoxConstraints(maxHeight: 230),
@@ -2913,145 +3852,42 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
               borderRadius: BorderRadius.circular(12),
               border: Border.all(color: const Color(0xFFE2E8F0)),
             ),
-            child: items.isEmpty
-                ? Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    child: Center(
-                      child: Text(
-                        'No items in order',
-                        style: GoogleFonts.urbanist(
-                          fontSize: 12,
-                          color: Colors.grey.shade400,
-                          fontStyle: FontStyle.italic,
+            child: kind == _AlertKind.roomCharge
+                ? _roomChange(order, compact: false)
+                : kind == _AlertKind.transferred
+                ? _tableMove(order, compact: false)
+                : (lines.isEmpty && !showRoom)
+                    ? Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        child: Center(
+                          child: Text(
+                            'No items in order',
+                            style: GoogleFonts.urbanist(
+                              fontSize: 12,
+                              color: Colors.grey.shade400,
+                              fontStyle: FontStyle.italic,
+                            ),
+                          ),
                         ),
+                      )
+                    : ListView.separated(
+                        shrinkWrap: true,
+                        physics: const ClampingScrollPhysics(),
+                        itemCount: lines.length + (showRoom ? 1 : 0),
+                        separatorBuilder: (context, index) => Divider(
+                          height: 8,
+                          thickness: 0.6,
+                          color: Colors.grey.shade200,
+                        ),
+                        itemBuilder: (context, index) => index < lines.length
+                            ? _lineRow(lines[index], compact: false)
+                            : _roomRow(order, compact: false),
                       ),
-                    ),
-                  )
-                : ListView.separated(
-                    shrinkWrap: true,
-                    physics: const ClampingScrollPhysics(),
-                    itemCount: items.length + (order.serviceCharge > 0 ? 1 : 0),
-                    separatorBuilder: (context, index) => Divider(
-                      height: 8,
-                      thickness: 0.6,
-                      color: Colors.grey.shade200,
-                    ),
-                    itemBuilder: (context, index) {
-                      if (index < items.length) {
-                        final item = items[index];
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 3),
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.center,
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                decoration: BoxDecoration(
-                                  color: primaryColor.withValues(alpha: 0.08),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  '${item.quantity.toInt()}x',
-                                  style: GoogleFonts.urbanist(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w900,
-                                    color: primaryColor,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      item.name,
-                                      style: GoogleFonts.urbanist(
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w700,
-                                        color: const Color(0xFF1E293B),
-                                      ),
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    if (item.remarks != null && item.remarks!.trim().isNotEmpty)
-                                      Text(
-                                        item.remarks!.trim(),
-                                        style: GoogleFonts.urbanist(
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.w600,
-                                          color: Colors.grey.shade500,
-                                          fontStyle: FontStyle.italic,
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                '₱${formatPrice(item.lineTotal)}',
-                                style: GoogleFonts.urbanist(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w800,
-                                  color: const Color(0xFF0D9488),
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      } else {
-                        // Room Charge row
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 3),
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.center,
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFFFEF3C7),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  'ROOM',
-                                  style: GoogleFonts.urbanist(
-                                    fontSize: 9,
-                                    fontWeight: FontWeight.w900,
-                                    color: const Color(0xFFD97706),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  'Room Charge',
-                                  style: GoogleFonts.urbanist(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w700,
-                                    color: const Color(0xFF1E293B),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                '₱${formatPrice(order.serviceCharge)}',
-                                style: GoogleFonts.urbanist(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w800,
-                                  color: const Color(0xFFD97706),
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      }
-                    },
-                  ),
           ),
         ),
         const SizedBox(height: 10),
 
-        // Total Amount Row
+        // Total
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
           decoration: BoxDecoration(
@@ -3062,46 +3898,42 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Row(
-                children: [
-                  Text(
-                    'TOTAL DUE',
-                    style: GoogleFonts.urbanist(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w900,
-                      color: Colors.grey.shade500,
-                      letterSpacing: 0.8,
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade100,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Text(
-                      order.serviceCharge > 0 ? '${items.length} items + Room' : '${items.length} items',
-                      style: GoogleFonts.urbanist(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.grey.shade600,
-                      ),
-                    ),
-                  ),
-                ],
+              Text(
+                totalLabel,
+                style: GoogleFonts.urbanist(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w900,
+                  color: struck ? _red : Colors.grey.shade500,
+                  letterSpacing: 0.8,
+                ),
               ),
               Text(
-                '₱$totalStr',
+                '₱${formatPrice(totalAmount)}',
                 style: GoogleFonts.urbanist(
                   fontSize: 20,
                   fontWeight: FontWeight.w900,
-                  color: amberAccent,
+                  color: totalColor,
+                  decoration: struck ? TextDecoration.lineThrough : null,
+                  decorationColor: totalColor,
                 ),
               ),
             ],
           ),
         ),
+        if (showNewTotal) ...[
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerRight,
+            child: Text(
+              'New total due: ₱${formatPrice(order.grandTotal)}',
+              style: GoogleFonts.urbanist(
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+                color: Colors.grey.shade600,
+              ),
+            ),
+          ),
+        ],
         const SizedBox(height: 12),
 
         // Acknowledge Button
@@ -3134,13 +3966,10 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
   }
 
   // --- MULTI-ORDERS VIEW ---
-  Widget _buildMultiOrdersView(
-    BuildContext context,
-  ) {
+  Widget _buildMultiOrdersView(BuildContext context) {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Scrollable list of order cards
         Flexible(
           child: Container(
             constraints: const BoxConstraints(maxHeight: 380),
@@ -3151,9 +3980,12 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
               separatorBuilder: (context, index) => const SizedBox(height: 10),
               itemBuilder: (context, index) {
                 final order = widget.orders[index];
-                final tableDisplay = _formatTableForDisplay(order.tableNumber, order.orderType);
+                final tableDisplay = order.isTakeOut ? order.takeOutLabel : _formatTableForDisplay(order.tableNumber, order.orderType);
                 final orderNo = order.orderNo ?? '#${order.id}';
-                final items = order.items;
+                final kind = _kindOf(order);
+                final lines = _linesFor(order);
+                final (tagLabel, tagColor) = _kindTag(order);
+                final (totalLabel, totalAmount, totalColor, struck) = _totalFor(order);
 
                 return Container(
                   padding: const EdgeInsets.all(12),
@@ -3165,31 +3997,39 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Header: Table badge and order number
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Row(
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.all(5),
-                                decoration: BoxDecoration(
-                                  color: primaryColor.withValues(alpha: 0.08),
-                                  borderRadius: BorderRadius.circular(6),
+                          Flexible(
+                            child: Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(5),
+                                  decoration: BoxDecoration(
+                                    color: primaryColor.withValues(alpha: 0.08),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: const Icon(Icons.table_restaurant_rounded, color: goldAccent, size: 16),
                                 ),
-                                child: const Icon(Icons.table_restaurant_rounded, color: goldAccent, size: 16),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                tableDisplay,
-                                style: GoogleFonts.urbanist(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w900,
-                                  color: primaryColor,
+                                const SizedBox(width: 8),
+                                Flexible(
+                                  child: Text(
+                                    tableDisplay,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.urbanist(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w900,
+                                      color: primaryColor,
+                                    ),
+                                  ),
                                 ),
-                              ),
-                            ],
+                                const SizedBox(width: 6),
+                                _tag(tagLabel, tagColor),
+                              ],
+                            ),
                           ),
+                          const SizedBox(width: 6),
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                             decoration: BoxDecoration(
@@ -3209,9 +4049,12 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
                         ],
                       ),
                       const SizedBox(height: 8),
-
-                      // Items list preview
-                      if (items.isEmpty)
+                      _banner(order, compact: true),
+                      if (kind == _AlertKind.roomCharge)
+                        _roomChange(order, compact: true)
+                      else if (kind == _AlertKind.transferred)
+                        _tableMove(order, compact: true)
+                      else if (lines.isEmpty)
                         Padding(
                           padding: const EdgeInsets.symmetric(vertical: 4),
                           child: Text(
@@ -3223,134 +4066,47 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
                             ),
                           ),
                         )
-                      else
-                        ...items.take(4).map((item) {
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 2),
-                            child: Row(
-                              children: [
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                                  decoration: BoxDecoration(
-                                    color: primaryColor.withValues(alpha: 0.08),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: Text(
-                                    '${item.quantity.toInt()}x',
-                                    style: GoogleFonts.urbanist(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w900,
-                                      color: primaryColor,
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                Expanded(
-                                  child: Text(
-                                    item.name,
-                                    style: GoogleFonts.urbanist(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w700,
-                                      color: const Color(0xFF1E293B),
-                                    ),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  '₱${formatPrice(item.lineTotal)}',
-                                  style: GoogleFonts.urbanist(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w800,
-                                    color: const Color(0xFF0D9488),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          );
-                        }),
-                      if (items.length > 4)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 2),
-                          child: Text(
-                            '+ ${items.length - 4} more items',
-                            style: GoogleFonts.urbanist(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w700,
-                              color: Colors.grey.shade500,
-                              fontStyle: FontStyle.italic,
+                      else ...[
+                        ...lines.take(4).map((line) => _lineRow(line, compact: true)),
+                        if (lines.length > 4)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: Text(
+                              '+ ${lines.length - 4} more items',
+                              style: GoogleFonts.urbanist(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.grey.shade500,
+                                fontStyle: FontStyle.italic,
+                              ),
                             ),
                           ),
-                        ),
-                      if (order.serviceCharge > 0)
-                        Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 2),
-                          child: Row(
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFFFEF3C7),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  'ROOM',
-                                  style: GoogleFonts.urbanist(
-                                    fontSize: 8,
-                                    fontWeight: FontWeight.w900,
-                                    color: const Color(0xFFD97706),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              Expanded(
-                                child: Text(
-                                  'Room Charge',
-                                  style: GoogleFonts.urbanist(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w700,
-                                    color: const Color(0xFF1E293B),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                '₱${formatPrice(order.serviceCharge)}',
-                                style: GoogleFonts.urbanist(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w800,
-                                  color: const Color(0xFFD97706),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-
+                      ],
+                      if (_showsRoomRow(order)) _roomRow(order, compact: true),
                       const SizedBox(height: 6),
                       Divider(height: 8, thickness: 0.6, color: Colors.grey.shade200),
                       const SizedBox(height: 4),
-
-                      // Subtotal & Individual Acknowledge Button
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           Row(
                             children: [
                               Text(
-                                'DUE: ',
+                                '$totalLabel: ',
                                 style: GoogleFonts.urbanist(
                                   fontSize: 10,
                                   fontWeight: FontWeight.w800,
-                                  color: Colors.grey.shade500,
+                                  color: struck ? _red : Colors.grey.shade500,
                                 ),
                               ),
                               Text(
-                                '₱${formatPrice(order.grandTotal)}',
+                                '₱${formatPrice(totalAmount)}',
                                 style: GoogleFonts.urbanist(
                                   fontSize: 14,
                                   fontWeight: FontWeight.w900,
-                                  color: amberAccent,
+                                  color: totalColor,
+                                  decoration: struck ? TextDecoration.lineThrough : null,
+                                  decorationColor: totalColor,
                                 ),
                               ),
                             ],
@@ -3417,6 +4173,9 @@ class _AnimatedOrderCard extends StatefulWidget {
   final VoidCallback onSettle;
   final VoidCallback onEdit;
   final VoidCallback onCancel;
+  final VoidCallback onExtendRoomCharge;
+  /// Called before this cashier changes the order itself (add items, transfer).
+  final VoidCallback? onSelfChange;
   final bool isGroundFloor;
   final bool isPinned;
   final VoidCallback onPin;
@@ -3433,6 +4192,8 @@ class _AnimatedOrderCard extends StatefulWidget {
     required this.onSettle,
     required this.onEdit,
     required this.onCancel,
+    required this.onExtendRoomCharge,
+    this.onSelfChange,
     required this.isGroundFloor,
     required this.isPinned,
     required this.onPin,
@@ -3465,21 +4226,17 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
     return 0;
   }
 
-  // How many room-charge units the current service charge represents, when
-  // it divides evenly into the base rate (in 0.5 steps, to match the
-  // half-session qty admin's manual order can create); null when it doesn't
-  // (e.g. an extra manual service charge was mixed in) so we just show the total.
-  double? get _roomChargeUnits {
-    final rate = _roomChargeRate;
-    final total = widget.order.serviceCharge;
-    if (rate <= 0 || total <= 0) return null;
-    final q = total / rate;
-    final rounded = (q * 2).round() / 2;
-    if (rounded >= 0.5 && (q - rounded).abs() < 0.01) return rounded;
-    return null;
+  /// Tapping the card opens the full order breakdown.
+  void _openDetails() {
+    OrderDetailsSheet.show(
+      context,
+      order: widget.order,
+      roomChargeRate: _roomChargeRate,
+      floorLabel: widget.isGroundFloor ? 'GF' : '2F',
+      isHistory: widget.isHistory,
+      onSettle: widget.isHistory ? null : widget.onSettle,
+    );
   }
-
-  String _formatRoomChargeUnits(double v) => v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(1);
 
   @override
   Widget build(BuildContext context) {
@@ -3494,7 +4251,9 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
     }
     if (roomOrNumber.isEmpty) {
       tableLabel = 'Type';
-      roomOrNumber = widget.order.orderType ?? 'Dine-In';
+      roomOrNumber = widget.order.isTakeOut
+          ? widget.order.takeOutLabel
+          : (widget.order.orderType ?? 'Dine-In');
     }
 
     final items = widget.order.items;
@@ -3504,7 +4263,16 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
     return Stack(
       clipBehavior: Clip.none,
       children: [
-        MouseRegion(
+        Padding(
+          padding: EdgeInsets.only(
+            top: widget.isHistory ? 0 : CardCancelButton.overhang,
+            right: widget.isHistory ? 0 : CardCancelButton.overhang,
+          ),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _openDetails,
+            child: MouseRegion(
+      cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
       child: AnimatedContainer(
@@ -3720,6 +4488,16 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
                       _buildStatusChip(widget.order.status),
+                      if (!widget.isHistory)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: RoomCountdownBadge(
+                            order: widget.order,
+                            fallbackRate: _roomChargeRate,
+                            onDark: true,
+                            dense: true,
+                          ),
+                        ),
                       const SizedBox(height: 4),
                       OfflineOrderBadge(orderId: widget.order.id),
                     ],
@@ -3789,117 +4567,25 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                         ),
                       );
                     }),
-                    if (widget.order.serviceCharge > 0)
-                      Builder(
-                        builder: (context) {
-                          const gold = Color(0xFFD97706);
-                          final rate = _roomChargeRate;
-                          final units = _roomChargeUnits;
-                          final showBreakdown = rate > 0 && units != null && units >= 1;
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 6),
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
-                                  decoration: BoxDecoration(
-                                    color: gold.withValues(alpha: 0.12),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: Text(
-                                    'ROOM',
-                                    style: GoogleFonts.urbanist(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w900,
-                                      color: gold,
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Row(
-                                        children: [
-                                          Flexible(
-                                            child: Text(
-                                              'Room Charge',
-                                              style: GoogleFonts.urbanist(
-                                                fontSize: 13.5,
-                                                fontWeight: FontWeight.w800,
-                                                color: gold,
-                                              ),
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                            ),
-                                          ),
-                                          if (showBreakdown && units > 1) ...[
-                                            const SizedBox(width: 6),
-                                            Container(
-                                              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                                              decoration: BoxDecoration(
-                                                color: gold.withValues(alpha: 0.14),
-                                                borderRadius: BorderRadius.circular(4),
-                                              ),
-                                              child: Text(
-                                                '×${_formatRoomChargeUnits(units)}',
-                                                style: GoogleFonts.urbanist(
-                                                  fontSize: 11,
-                                                  fontWeight: FontWeight.w900,
-                                                  color: gold,
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        ],
-                                      ),
-                                      if (showBreakdown)
-                                        Text(
-                                          units > 1
-                                              ? 'Base ₱${formatPrice(rate)} + ${_formatRoomChargeUnits(units - 1)} extension${units - 1 == 1 ? '' : 's'} (₱${formatPrice(rate)} × ${_formatRoomChargeUnits(units)})'
-                                              : 'Base rate ₱${formatPrice(rate)}',
-                                          style: GoogleFonts.urbanist(
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w600,
-                                            color: Colors.grey.shade500,
-                                          ),
-                                          maxLines: 2,
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  '₱${formatPrice(widget.order.serviceCharge)}',
-                                  style: GoogleFonts.urbanist(
-                                    fontSize: 13.5,
-                                    fontWeight: FontWeight.w800,
-                                    color: gold,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
+                    if (RoomChargeHistory.hasContent(widget.order, fallbackRate: _roomChargeRate))
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 4),
+                        child: RoomChargeHistory(
+                          order: widget.order,
+                          fallbackRate: _roomChargeRate,
+                          dense: true,
+                        ),
                       ),
-                    if (remainingCount > 0)
-                      InkWell(
-                        onTap: () {
-                          BillOutModal.show(
-                            context,
-                            order: widget.order,
-                            onSettle: widget.onSettle,
-                          );
-                        },
+                    InkWell(
+                        onTap: _openDetails,
                         child: Padding(
                           padding: const EdgeInsets.only(top: 2, bottom: 2),
                           child: Row(
                             children: [
                               Text(
-                                '+ $remainingCount more items',
+                                remainingCount > 0
+                                    ? '+ $remainingCount more items · View breakdown'
+                                    : 'View breakdown',
                                 style: GoogleFonts.urbanist(
                                   fontSize: 12,
                                   fontWeight: FontWeight.w800,
@@ -3979,6 +4665,7 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                             width: 36,
                             child: OutlinedButton(
                               onPressed: () async {
+                                widget.onSelfChange?.call();
                                 final rawName = (widget.order.tableNumber ?? '').trim();
                                 final currentName = rawName.isEmpty
                                     ? (widget.order.orderType ?? 'Dine-In')
@@ -3991,6 +4678,7 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                                   currentTableName: currentName,
                                   currentTableId: widget.order.tableId,
                                   allTables: widget.tables,
+                                  order: widget.order,
                                 );
                                 if (transferred == true && mounted) {
                                   await widget.onRefresh();
@@ -4007,36 +4695,6 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                           ),
                           const SizedBox(width: 6),
                         ],
-                        // Bill Out
-                        Expanded(
-                          flex: 1,
-                          child: SizedBox(
-                            height: 36,
-                            child: OutlinedButton.icon(
-                              onPressed: () {
-                                BillOutModal.show(
-                                  context,
-                                  order: widget.order,
-                                  onSettle: widget.onSettle,
-                                );
-                              },
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: primaryColor,
-                                side: BorderSide(color: Colors.grey.shade300),
-                                padding: EdgeInsets.zero,
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                              ),
-                              icon: const Icon(Icons.receipt_long_outlined, size: 14),
-                              label: Text(
-                                'Bill Out',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 12),
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
                         // Add Items
                         Expanded(
                           flex: 1,
@@ -4044,6 +4702,7 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                             height: 36,
                             child: OutlinedButton.icon(
                               onPressed: () async {
+                                widget.onSelfChange?.call();
                                 WaiterTable targetTable;
                                 final found = widget.tables.where((t) => t.id == widget.order.tableId).toList();
                                 if (found.isNotEmpty) {
@@ -4062,6 +4721,7 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                                       table: targetTable,
                                       menuItems: widget.menuItems,
                                       existingOrder: widget.order,
+                                      startInSwitchMenu: true, // new menu by default
                                     ),
                                   ),
                                 );
@@ -4134,6 +4794,30 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
                         ),
                       ],
                     ),
+                    // Rooms only: add another session without leaving the cashier.
+                    if (_roomChargeRate > 0) ...[
+                      const SizedBox(height: 6),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 38,
+                        child: OutlinedButton.icon(
+                          onPressed: widget.onExtendRoomCharge,
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xFF059669),
+                            side: const BorderSide(color: Color(0xFF059669), width: 1.2),
+                            padding: EdgeInsets.zero,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                          ),
+                          icon: const Icon(Icons.more_time_rounded, size: 17),
+                          label: Text(
+                            'Extend Room Charge',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 13),
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
                 ],
               ),
@@ -4142,30 +4826,15 @@ class _AnimatedOrderCardState extends State<_AnimatedOrderCard> {
         ),
       ),
         ),
-        // Circular X button floating at the top-right corner, matching
-        // waiterApp's table-card cancel button — only for active orders.
+          ),
+        ),
+        // Cancel X on the card's top-right corner (active orders only). Big hit
+        // area, inside the Stack so it's actually tappable.
         if (!widget.isHistory)
           Positioned(
-            top: -8,
-            right: -8,
-            child: Material(
-              color: Colors.white,
-              shape: const CircleBorder(),
-              elevation: 3,
-              child: InkWell(
-                customBorder: const CircleBorder(),
-                onTap: widget.onCancel,
-                child: Container(
-                  width: 26,
-                  height: 26,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.red.shade200),
-                  ),
-                  child: Icon(Icons.close_rounded, size: 16, color: Colors.red.shade700),
-                ),
-              ),
-            ),
+            top: 0,
+            right: 0,
+            child: CardCancelButton(onTap: widget.onCancel),
           ),
       ],
     );
@@ -4189,22 +4858,13 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
   double _manualDiscount = 0.0;
   double _cashTendered = 0.0;
 
-  // How many room-charge units the service charge represents, when it divides
-  // evenly into the table's base ROOM_CHARGE (in 0.5 steps, to match the
-  // half-session qty admin's manual order can create); null otherwise. Lets
-  // the sheet spell out WHY the room charge total is what it is after
-  // extensions.
-  double? get _roomChargeUnits {
-    final rate = widget.order.roomCharge;
-    final total = widget.order.serviceCharge;
-    if (rate <= 0 || total <= 0) return null;
-    final q = total / rate;
-    final rounded = (q * 2).round() / 2;
-    if (rounded >= 0.5 && (q - rounded).abs() < 0.01) return rounded;
-    return null;
+  // Room hours billed in total (every room the order used), for the
+  // "Room Charge (2 hrs)" line; null for a regular table.
+  double? get _roomHours {
+    final segments = roomChargeSegmentsOf(widget.order);
+    if (segments.isEmpty) return null;
+    return segments.fold<double>(0, (sum, s) => sum + s.hours);
   }
-
-  String _formatRoomChargeUnits(double v) => v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(1);
 
   @override
   void initState() {
@@ -4331,7 +4991,7 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                               const Icon(Icons.chair_alt_rounded, color: Colors.white, size: 18),
                               const SizedBox(width: 8),
                               Text(
-                                widget.order.tableNumber != null ? 'Table ${widget.order.tableNumber}' : 'Dine-In',
+                                widget.order.isTakeOut ? widget.order.takeOutLabel : (widget.order.tableNumber != null ? 'Table ${widget.order.tableNumber}' : 'Dine-In'),
                                 style: GoogleFonts.urbanist(
                                   fontSize: 16,
                                   fontWeight: FontWeight.w900,
@@ -4412,50 +5072,9 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                             ],
                           ),
                         )),
-                        if (roomCharge > 0) ...[
-                          Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 6),
-                            child: Row(
-                              children: [
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFFD97706).withValues(alpha: 0.12),
-                                    borderRadius: BorderRadius.circular(6),
-                                  ),
-                                  child: Text(
-                                    'ROOM',
-                                    style: GoogleFonts.urbanist(fontWeight: FontWeight.w900, color: const Color(0xFFD97706), fontSize: 11.5),
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        _roomChargeUnits != null && _roomChargeUnits! > 1
-                                            ? 'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})  ×${_formatRoomChargeUnits(_roomChargeUnits!)}'
-                                            : 'Room Charge (${widget.order.tableNumber ?? 'VIP Room'})',
-                                        style: GoogleFonts.urbanist(fontSize: 14.5, fontWeight: FontWeight.w800, color: const Color(0xFFD97706)),
-                                      ),
-                                      if (_roomChargeUnits != null && widget.order.roomCharge > 0)
-                                        Text(
-                                          _roomChargeUnits! > 1
-                                              ? 'Base ₱${formatPrice(widget.order.roomCharge)} + ${_formatRoomChargeUnits(_roomChargeUnits! - 1)} extension${_roomChargeUnits! - 1 == 1 ? '' : 's'}  (₱${formatPrice(widget.order.roomCharge)} × ${_formatRoomChargeUnits(_roomChargeUnits!)})'
-                                              : 'Base rate ₱${formatPrice(widget.order.roomCharge)}',
-                                          style: GoogleFonts.urbanist(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.grey.shade500),
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                                Text(
-                                  '₱${formatPrice(roomCharge)}',
-                                  style: GoogleFonts.urbanist(fontSize: 14.5, fontWeight: FontWeight.w800, color: const Color(0xFFD97706)),
-                                ),
-                              ],
-                            ),
-                          ),
+                        if (RoomChargeHistory.hasContent(widget.order)) ...[
+                          const SizedBox(height: 4),
+                          RoomChargeHistory(order: widget.order),
                         ],
                         const Divider(height: 20),
                         if (roomCharge > 0) ...[
@@ -4471,8 +5090,8 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
                               Text(
-                                _roomChargeUnits != null && _roomChargeUnits! > 1 && widget.order.roomCharge > 0
-                                    ? 'Room Charge (₱${formatPrice(widget.order.roomCharge)} × ${_formatRoomChargeUnits(_roomChargeUnits!)})'
+                                _roomHours != null
+                                    ? 'Room Charge (${formatRoomHours(_roomHours!)})'
                                     : 'Room Charge',
                                 style: GoogleFonts.urbanist(fontSize: 13.5, fontWeight: FontWeight.w700, color: const Color(0xFFD97706)),
                               ),
@@ -4513,42 +5132,81 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                   ),
 
                   // 3. AMOUNT RECEIVED / TENDERED (REQUIRED FOR ALL PAYMENT METHODS)
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        isCash ? 'CASH TENDERED (₱)' : '$_selectedPaymentMethod AMOUNT PAID (₱)',
-                        style: GoogleFonts.urbanist(fontSize: 12.5, fontWeight: FontWeight.w900, color: Colors.grey.shade600, letterSpacing: 1.2),
-                      ),
-                      InkWell(
-                        onTap: () {
-                          setState(() {
-                            _tenderedController.text = formatPrice(finalAmountDue);
-                            _cashTendered = finalAmountDue;
-                          });
-                        },
-                        borderRadius: BorderRadius.circular(8),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: emerald.withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: emerald.withValues(alpha: 0.3)),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(Icons.flash_on_rounded, size: 14, color: emerald),
-                              const SizedBox(width: 4),
-                              Text(
-                                'Exact: ₱${formatPrice(finalAmountDue)}',
-                                style: GoogleFonts.urbanist(fontSize: 11.5, fontWeight: FontWeight.w800, color: emerald),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 14),
+                    child: Text(
+                      isCash ? 'CASH TENDERED (₱)' : '$_selectedPaymentMethod AMOUNT PAID (₱)',
+                      style: GoogleFonts.urbanist(fontSize: 12.5, fontWeight: FontWeight.w900, color: Colors.grey.shade600, letterSpacing: 1.2),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  // One-tap "customer paid the exact amount". Big, full width and
+                  // solid green so it can't be missed (it was a tiny chip).
+                  Builder(
+                    builder: (context) {
+                      final isExact = _cashTendered > 0 &&
+                          (_cashTendered - finalAmountDue).abs() < 0.005;
+                      return Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(16),
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            setState(() {
+                              _tenderedController.text = formatPrice(finalAmountDue);
+                              _cashTendered = finalAmountDue;
+                            });
+                          },
+                          child: Ink(
+                            height: 56,
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(16),
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF10B981), Color(0xFF047857)],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
                               ),
-                            ],
+                              boxShadow: [
+                                BoxShadow(
+                                  color: emerald.withValues(alpha: 0.35),
+                                  blurRadius: 12,
+                                  offset: const Offset(0, 5),
+                                ),
+                              ],
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  isExact ? Icons.check_circle_rounded : Icons.flash_on_rounded,
+                                  size: 24,
+                                  color: Colors.white,
+                                ),
+                                const SizedBox(width: 10),
+                                Text(
+                                  isExact ? 'EXACT AMOUNT ✓' : 'EXACT AMOUNT',
+                                  style: GoogleFonts.urbanist(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w900,
+                                    color: Colors.white,
+                                    letterSpacing: 1,
+                                  ),
+                                ),
+                                const Spacer(),
+                                Text(
+                                  '₱${formatPrice(finalAmountDue)}',
+                                  style: GoogleFonts.urbanist(
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w900,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         ),
-                      ),
-                    ],
+                      );
+                    },
                   ),
                   const SizedBox(height: 8),
                   Container(
@@ -5087,6 +5745,48 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Unsettled / History / Activity as the shared sliding segmented control, driven by the
+/// page's DefaultTabController (so swiping the list moves the pill too).
+class _CashierTabs extends StatelessWidget {
+  final int unsettledCount;
+  final int historyCount;
+
+  const _CashierTabs({
+    required this.unsettledCount,
+    required this.historyCount,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = DefaultTabController.of(context);
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) => SlidingSegments(
+        selectedIndex: controller.index,
+        position: controller.animation,
+        onChanged: controller.animateTo,
+        segments: [
+          SegmentLabel(
+            label: 'unsettled'.tr,
+            icon: Icons.pending_actions_rounded,
+            count: unsettledCount,
+            alert: true,
+          ),
+          SegmentLabel(
+            label: 'history'.tr,
+            icon: Icons.history_rounded,
+            count: historyCount,
+          ),
+          SegmentLabel(
+            label: 'activity'.tr,
+            icon: Icons.manage_history_rounded,
+          ),
+        ],
       ),
     );
   }

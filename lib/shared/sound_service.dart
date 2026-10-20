@@ -31,6 +31,18 @@ class SoundService {
     }
   }
 
+  /// Chime + speak [text] once (e.g. a room's "15 minutes left"). A running
+  /// repeating new-order announcement is paused for it and picks up again
+  /// right after.
+  static void announceOnce(String text) {
+    if (isMuted) return;
+    try {
+      speakOncePlatform(text, resumeLoopText: activeAlertTextNotifier.value);
+    } catch (e) {
+      debugPrint('Error playing announcement: $e');
+    }
+  }
+
   static void startRepeatingAlert(String announcementText) {
     activeAlertTextNotifier.value = announcementText;
     if (isMuted) return;

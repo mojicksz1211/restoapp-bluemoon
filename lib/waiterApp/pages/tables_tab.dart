@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../../shared/widgets/card_cancel_button.dart';
+import '../../shared/widgets/centered_section_header.dart';
 import '../../shared/widgets/offline_order_badge.dart';
 import '../models.dart' show formatPrice;
 import '../waiter_models.dart';
 import '../widgets/waiter_ui.dart';
+import '../widgets/room_charge_history.dart' show RoomCountdownBadge;
+import '../services/room_time_alerts.dart';
 import '../services/waiter_cart_store.dart';
 
 class TablesTab extends StatelessWidget {
@@ -16,6 +20,8 @@ class TablesTab extends StatelessWidget {
   final void Function(WaiterTable table) onEditOrder;
   final void Function(WaiterTable table) onExtendRoomCharge;
   final void Function(WaiterOrder order)? onCancelOrder;
+  // Starts a take-out order (no table). Null hides the button.
+  final VoidCallback? onNewTakeOut;
   // Lets the sidebar's Occupied/Available submenu reuse this same grid with
   // a pre-filtered `tables` list, just relabeling the header/empty-state
   // text to match — the filtering itself happens in the caller.
@@ -44,6 +50,7 @@ class TablesTab extends StatelessWidget {
     required this.onEditOrder,
     required this.onExtendRoomCharge,
     this.onCancelOrder,
+    this.onNewTakeOut,
     this.title = 'Table Monitoring',
     this.emptyMessage = 'No tables found',
     this.currentFilter = 'all',
@@ -63,58 +70,38 @@ class TablesTab extends StatelessWidget {
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.all(16),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SectionHeader(
-            title: title,
-            subtitle: '${tables.length} tables',
-          ),
+          _buildHeader(),
           if (showFilterChips && onFilterChanged != null) ...[
+            const SizedBox(height: 14),
+            _buildFilterPills(),
+          ],
+          if (onNewTakeOut != null) ...[
             const SizedBox(height: 8),
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(vertical: 4),
-              child: Row(
-                children: [
-                  _buildFilterChip(
-                    key: 'all',
-                    label: 'All',
-                    count: totalAllCount,
-                    icon: Icons.table_bar_rounded,
+            // Take-outs are rare, so this stays a quiet outlined chip.
+            Align(
+              alignment: Alignment.centerRight,
+              child: SizedBox(
+                height: 36,
+                child: OutlinedButton.icon(
+                  onPressed: onNewTakeOut,
+                  icon: const Icon(Icons.shopping_bag_outlined, size: 17),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: _navy,
+                    backgroundColor: Colors.white,
+                    side: const BorderSide(color: _line, width: 1.2),
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
                   ),
-                  if (lockedFloor != '2f') ...[
-                    _buildFilterChip(
-                      key: 'gf_available',
-                      label: 'GF Available',
-                      count: totalGfAvailableCount,
-                      icon: Icons.check_circle_outline_rounded,
-                      accentColor: Colors.green.shade700,
+                  label: Text(
+                    'Take Out',
+                    style: GoogleFonts.urbanist(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w800,
                     ),
-                    _buildFilterChip(
-                      key: 'gf_occupied',
-                      label: 'GF Occupied',
-                      count: totalGfOccupiedCount,
-                      icon: Icons.person_rounded,
-                      accentColor: Colors.orange.shade700,
-                    ),
-                  ],
-                  if (lockedFloor != 'gf') ...[
-                    _buildFilterChip(
-                      key: '2f_available',
-                      label: '2F Available',
-                      count: total2fAvailableCount,
-                      icon: Icons.check_circle_outline_rounded,
-                      accentColor: Colors.green.shade700,
-                    ),
-                    _buildFilterChip(
-                      key: '2f_occupied',
-                      label: '2F Occupied',
-                      count: total2fOccupiedCount,
-                      icon: Icons.person_rounded,
-                      accentColor: Colors.orange.shade700,
-                    ),
-                  ],
-                ],
+                  ),
+                ),
               ),
             ),
           ],
@@ -125,91 +112,143 @@ class TablesTab extends StatelessWidget {
     );
   }
 
-  Widget _buildFilterChip({
+  static const _navy = Color(0xFF0C0E2B);
+  static const _navy2 = Color(0xFF1B1E4A);
+  static const _gold = Color(0xFFE8C468);
+  static const _line = Color(0xFFDDDED3);
+  static const _muted = Color(0xFF6B6F80);
+
+  // Centered title between thin gold rules, table count underneath.
+  Widget _buildHeader() => CenteredSectionHeader(
+        title: title,
+        subtitle: '${tables.length} tables',
+      );
+
+  // Filter pills, centered and equal width (same pill cards as the Switch
+  // Menu categories): up to 3 per row, extra ones wrap onto a centered row.
+  Widget _buildFilterPills() {
+    final pills = <(String, String, int, IconData, Color?)>[
+      ('all', 'All', totalAllCount, Icons.table_bar_rounded, null),
+      if (lockedFloor != '2f') ...[
+        (
+          'gf_available',
+          'GF Available',
+          totalGfAvailableCount,
+          Icons.check_circle_outline_rounded,
+          Colors.green.shade700,
+        ),
+        (
+          'gf_occupied',
+          'GF Occupied',
+          totalGfOccupiedCount,
+          Icons.person_rounded,
+          Colors.orange.shade700,
+        ),
+      ],
+      if (lockedFloor != 'gf') ...[
+        (
+          '2f_available',
+          '2F Available',
+          total2fAvailableCount,
+          Icons.check_circle_outline_rounded,
+          Colors.green.shade700,
+        ),
+        (
+          '2f_occupied',
+          '2F Occupied',
+          total2fOccupiedCount,
+          Icons.person_rounded,
+          Colors.orange.shade700,
+        ),
+      ],
+    ];
+    final perRow = pills.length <= 3 ? pills.length : (pills.length == 4 ? 2 : 3);
+    const gap = 8.0;
+
+    return LayoutBuilder(
+      builder: (context, c) {
+        final w = (c.maxWidth - (perRow - 1) * gap) / perRow;
+        return Wrap(
+          alignment: WrapAlignment.center,
+          spacing: gap,
+          runSpacing: gap,
+          children: [
+            for (final p in pills)
+              SizedBox(
+                width: w,
+                height: 54,
+                child: _filterPill(
+                  key: p.$1,
+                  label: p.$2,
+                  count: p.$3,
+                  icon: p.$4,
+                  accentColor: p.$5,
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _filterPill({
     required String key,
     required String label,
     required int count,
     required IconData icon,
     Color? accentColor,
   }) {
-    final isSelected = currentFilter == key;
-    return Container(
-      margin: const EdgeInsets.only(right: 10, top: 3, bottom: 3),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(28),
-        child: InkWell(
-          onTap: () => onFilterChanged?.call(key),
-          borderRadius: BorderRadius.circular(28),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 200),
-            curve: Curves.easeOut,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(28),
-              gradient: isSelected
-                  ? const LinearGradient(
-                      colors: [Color(0xFF0C0E2B), Color(0xFF1B1E4A)],
-                    )
-                  : null,
-              color: isSelected ? null : Colors.white,
-              border: Border.all(
-                color: isSelected
-                    ? const Color(0xFF0C0E2B)
-                    : (accentColor != null ? accentColor.withValues(alpha: 0.5) : Colors.grey.shade300),
-                width: 1.2,
+    final selected = currentFilter == key;
+    final fg = selected ? _gold : _navy;
+    return GestureDetector(
+      onTap: () => onFilterChanged?.call(key),
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOutCubic,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          gradient: selected
+              ? const LinearGradient(colors: [_navy, _navy2])
+              : null,
+          color: selected ? null : Colors.white,
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(
+            color: selected
+                ? _navy
+                : (accentColor?.withValues(alpha: 0.55) ?? _line),
+          ),
+        ),
+        // Scales down instead of overflowing when pills share a phone.
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 22,
+                color: selected ? _gold : (accentColor ?? _navy),
               ),
-              boxShadow: [
-                BoxShadow(
-                  color: isSelected
-                      ? const Color(0xFF0C0E2B).withValues(alpha: 0.25)
-                      : Colors.black.withValues(alpha: 0.05),
-                  blurRadius: isSelected ? 10 : 4,
-                  offset: isSelected ? const Offset(0, 4) : const Offset(0, 2),
+              const SizedBox(width: 7),
+              Text(
+                label,
+                style: GoogleFonts.urbanist(
+                  color: fg,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w900,
                 ),
-              ],
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  icon,
-                  size: 20,
-                  color: isSelected
-                      ? const Color(0xFFE8C468)
-                      : (accentColor ?? const Color(0xFF0C0E2B)),
+              ),
+              const SizedBox(width: 7),
+              Text(
+                '$count',
+                style: GoogleFonts.urbanist(
+                  color: selected ? _gold.withValues(alpha: 0.8) : _muted,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w800,
                 ),
-                const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: GoogleFonts.urbanist(
-                    fontSize: 15,
-                    fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
-                    color: isSelected ? Colors.white : const Color(0xFF0C0E2B),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2.5),
-                  decoration: BoxDecoration(
-                    color: isSelected
-                        ? Colors.white.withValues(alpha: 0.2)
-                        : (accentColor != null ? accentColor.withValues(alpha: 0.12) : Colors.grey.shade100),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(
-                    '$count',
-                    style: GoogleFonts.urbanist(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.bold,
-                      color: isSelected
-                          ? Colors.white
-                          : (accentColor ?? Colors.grey.shade700),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -408,7 +447,12 @@ class _TableCard extends StatelessWidget {
     return Stack(
       clipBehavior: Clip.none,
       children: [
-        Material(
+        Padding(
+          padding: const EdgeInsets.only(
+            top: CardCancelButton.overhang,
+            right: CardCancelButton.overhang,
+          ),
+          child: Material(
       color: Colors.transparent,
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
@@ -551,11 +595,40 @@ class _TableCard extends StatelessWidget {
                 valueColor: orderStatusInfo.color,
               ),
               const SizedBox(height: 6),
-              _InfoRow(
-                label: 'Capacity',
-                value: table.capacity.toString(),
-                valueColor: Colors.white,
-              ),
+              if (activeOrder != null &&
+                  RoomCountdown.of(activeOrder, fallbackRate: table.roomCharge) != null)
+                Row(
+                  children: [
+                    Text(
+                      'Time Left',
+                      maxLines: 1,
+                      style: GoogleFonts.urbanist(
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white.withValues(alpha: 0.7),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerRight,
+                        child: RoomCountdownBadge(
+                          order: activeOrder,
+                          fallbackRate: table.roomCharge,
+                          onDark: true,
+                          dense: true,
+                        ),
+                      ),
+                    ),
+                  ],
+                )
+              else
+                _InfoRow(
+                  label: 'Capacity',
+                  value: table.capacity.toString(),
+                  valueColor: Colors.white,
+                ),
               const Spacer(),
               const SizedBox(height: 8),
               if (isAvailable)
@@ -659,30 +732,14 @@ class _TableCard extends StatelessWidget {
         ),
       ),
         ),
-        // Circular X button floating at the top-right corner, only when
-        // there's an active order on this table to cancel.
+        ),
+        // Cancel X on the card's top-right corner, only when there's an active
+        // order on this table. Big hit area, inside the Stack so it's tappable.
         if (activeOrder != null && onCancelOrder != null)
           Positioned(
-            top: -8,
-            right: -8,
-            child: Material(
-              color: Colors.white,
-              shape: const CircleBorder(),
-              elevation: 3,
-              child: InkWell(
-                customBorder: const CircleBorder(),
-                onTap: () => onCancelOrder!(activeOrder!),
-                child: Container(
-                  width: 26,
-                  height: 26,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.red.shade200),
-                  ),
-                  child: Icon(Icons.close_rounded, size: 16, color: Colors.red.shade700),
-                ),
-              ),
-            ),
+            top: 0,
+            right: 0,
+            child: CardCancelButton(onTap: () => onCancelOrder!(activeOrder!)),
           ),
       ],
     );

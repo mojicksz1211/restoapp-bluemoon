@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../shared/app_config.dart';
+import '../../shared/login_accounts.dart';
+import '../../shared/session_presence.dart';
 import '../../shared/floor_utils.dart';
 import '../../shared/globals.dart';
 import '../../shared/lan_broadcast_service.dart';
@@ -202,7 +204,10 @@ class ApiService {
   // Logout
   static Future<void> logout() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.clear();
+    final accessToken = prefs.getString('access_token');
+    final serverUrl = await baseUrl;
+    // Keeps the tablet's login picker data (account list, one-tap logins).
+    await LoginAccountsStore.clearPreferencesKeepingLoginData(prefs);
     await prefs.setBool('is_logged_in', false);
     _cachedBaseUrl = null;
     // Tear the socket all the way down so the next login always starts a
@@ -212,6 +217,8 @@ class ApiService {
     // Stop the background foreground-service too — a signed-out device
     // shouldn't keep a persistent notification/socket connection alive.
     await BackgroundServiceManager.stop();
+    // Frees the account in other tablets' login picker right away.
+    await SessionPresence.endOnServer(accessToken, serverUrl);
   }
 
   // Get authentication headers
@@ -495,6 +502,89 @@ class ApiService {
   }
 
   // Get waiter orders (orders table status)
+  // Activity log (cashier app's Activity tab): what the branch's waiter /
+  // cashier tablets did to orders on one business day — [date] 'YYYY-MM-DD',
+  // the server's "today" (Blue Moon's day runs to 7 AM) when omitted.
+  // The last log loaded for today is kept on the device; offline it is
+  // returned instead (`is_offline: true`, `cached_at` = when it was loaded).
+  static const String _activityCacheKey = 'activity_log_cache';
+
+  static Future<Map<String, dynamic>> getActivityLogs({String? date}) async {
+    try {
+      _throwIfKnownOffline();
+      final url = Uri.parse('${await baseUrl}/api/activity-logs')
+          .replace(queryParameters: date == null ? null : {'date': date});
+      final headers = await getAuthHeaders();
+      final response = await http.get(url, headers: headers).timeout(_httpTimeout);
+
+      if (response.statusCode == 401) {
+        await logout();
+        return {
+          'success': false,
+          'error': 'Session expired. Please login again.',
+          'unauthorized': true,
+        };
+      }
+
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['success'] == true) {
+        if (date == null) {
+          unawaited(_saveActivityCache(data['date']?.toString(), data['data']));
+        }
+        return {'success': true, 'data': data['data'], 'date': data['date']};
+      }
+      return {
+        'success': false,
+        'error': data['error'] ?? 'Failed to load activity log',
+      };
+    } catch (e) {
+      final cached = await _readActivityCache();
+      if (cached != null && (date == null || date == cached['date'])) {
+        return {
+          'success': true,
+          'data': cached['data'],
+          'date': cached['date'],
+          'is_offline': true,
+          'cached_at': cached['cached_at'],
+        };
+      }
+      return {
+        'success': false,
+        'error': 'The activity log needs an internet connection.',
+        'is_offline': true,
+      };
+    }
+  }
+
+  static Future<void> _saveActivityCache(String? date, dynamic data) async {
+    if (date == null || data is! List) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _activityCacheKey,
+        jsonEncode({
+          'date': date,
+          'cached_at': DateTime.now().toUtc().toIso8601String(),
+          'data': data,
+        }),
+      );
+    } catch (e) {
+      debugPrint('[ACTIVITY LOG] Could not cache log: $e');
+    }
+  }
+
+  static Future<Map<String, dynamic>?> _readActivityCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_activityCacheKey);
+      if (raw == null) return null;
+      final decoded = jsonDecode(raw);
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<Map<String, dynamic>> getWaiterOrders() async {
     try {
       _throwIfKnownOffline();
@@ -652,11 +742,25 @@ class ApiService {
     }
   }
 
-  // Transfer table order (Lipat Mesa)
+  // Transfer table order (Lipat Mesa). When a room is involved,
+  // [prevRoomHours] is what the room being left is billed for and
+  // [newRoomHours] what the new room starts with (the server defaults to
+  // whole half-hours spent there / 1 hour when they're omitted).
+  // [carryOverTime]: moved room-to-room before 30 minutes — the new room
+  // continues the old room's clock (the server decides when omitted).
   static Future<Map<String, dynamic>> transferTableOrder({
     required int orderId,
     required int targetTableId,
+    double? prevRoomHours,
+    double? newRoomHours,
+    bool? carryOverTime,
   }) async {
+    final body = <String, dynamic>{
+      'target_table_id': targetTableId,
+      if (prevRoomHours != null) 'prev_room_hours': prevRoomHours,
+      if (newRoomHours != null) 'new_room_hours': newRoomHours,
+      if (carryOverTime != null) 'carry_over': carryOverTime,
+    };
     try {
       _throwIfKnownOffline();
       final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/transfer-table');
@@ -665,9 +769,7 @@ class ApiService {
       final response = await http.post(
         url,
         headers: headers,
-        body: jsonEncode({
-          'target_table_id': targetTableId,
-        }),
+        body: jsonEncode(body),
       ).timeout(_httpTimeout);
 
       if (response.statusCode == 401) {
@@ -681,7 +783,12 @@ class ApiService {
 
       final data = jsonDecode(response.body);
       if (response.statusCode == 200 && data['success'] == true) {
-        unawaited(OfflineSyncService.instance.transferLocalTableOrder(orderId, targetTableId));
+        final result = data['data'] is Map ? Map<String, dynamic>.from(data['data']) : <String, dynamic>{};
+        unawaited(OfflineSyncService.instance.transferLocalTableOrder(
+          orderId,
+          targetTableId,
+          serverResult: result,
+        ));
         return {
           'success': true,
           'data': data['data'],
@@ -694,11 +801,22 @@ class ApiService {
         'error': data['error'] ?? 'Failed to transfer table order',
       };
     } catch (e) {
-      await OfflineSyncService.instance.transferLocalTableOrder(orderId, targetTableId);
+      // The queued transfer reaches the server only once back online — it
+      // carries when it really happened, so the rooms' clocks aren't shifted
+      // to the sync time.
+      final transferredAt = OfflineSyncService.manilaNowSql();
+      await OfflineSyncService.instance.transferLocalTableOrder(
+        orderId,
+        targetTableId,
+        prevRoomHours: prevRoomHours,
+        newRoomHours: newRoomHours,
+        carryOverTime: carryOverTime ?? false,
+        transferredAt: transferredAt,
+      );
       await OfflineSyncService.instance.enqueueAction(
         type: 'transfer_table',
         orderId: orderId,
-        payload: {'target_table_id': targetTableId},
+        payload: {...body, 'transferred_at': transferredAt},
       );
       return {
         'success': true,
@@ -734,7 +852,11 @@ class ApiService {
 
       final data = jsonDecode(response.body);
       if (response.statusCode == 200 && data['success'] == true) {
-        unawaited(OfflineSyncService.instance.extendLocalRoomCharge(orderId, qty: qty));
+        unawaited(OfflineSyncService.instance.extendLocalRoomCharge(
+          orderId,
+          qty: qty,
+          serverResult: data['data'] is Map ? Map<String, dynamic>.from(data['data']) : null,
+        ));
         return {
           'success': true,
           'data': data['data'],
@@ -760,6 +882,63 @@ class ApiService {
     }
   }
 
+  // Set the order's room charge to [sessions] in total (0.5 steps; 0 = waived,
+  // i.e. 100% less) — the cashier/waiter "Room Charge" dialog. Same endpoint
+  // as extendRoomCharge, which only ever adds.
+  static Future<Map<String, dynamic>> setRoomChargeSessions({
+    required int orderId,
+    required double sessions,
+  }) async {
+    try {
+      _throwIfKnownOffline();
+      final url = Uri.parse('${await baseUrl}/api/waiter/orders/$orderId/extend-room-charge');
+      final headers = await getAuthHeaders();
+
+      final response = await http
+          .post(url, headers: headers, body: jsonEncode({'sessions': sessions}))
+          .timeout(_httpTimeout);
+
+      if (response.statusCode == 401) {
+        await logout();
+        return {
+          'success': false,
+          'error': 'Session expired. Please login again.',
+          'unauthorized': true,
+        };
+      }
+
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['success'] == true) {
+        unawaited(OfflineSyncService.instance.extendLocalRoomCharge(
+          orderId,
+          sessions: sessions,
+          serverResult: data['data'] is Map ? Map<String, dynamic>.from(data['data']) : null,
+        ));
+        return {
+          'success': true,
+          'data': data['data'],
+        };
+      }
+
+      return {
+        'success': false,
+        'error': data['error'] ?? 'Failed to update room charge',
+      };
+    } catch (e) {
+      await OfflineSyncService.instance.extendLocalRoomCharge(orderId, sessions: sessions);
+      await OfflineSyncService.instance.enqueueAction(
+        type: 'extend_room_charge',
+        orderId: orderId,
+        payload: {'sessions': sessions},
+      );
+      return {
+        'success': true,
+        'data': {'order_id': orderId, 'is_offline': true},
+        'is_offline': true,
+      };
+    }
+  }
+
   // Create order
   // items: List of order items with menu_id, qty, unit_price, and optional status
   static Future<Map<String, dynamic>> createOrder({
@@ -776,6 +955,9 @@ class ApiService {
     double discountAmount = 0.0,
     double grandTotal = 0.0,
     required List<Map<String, dynamic>> items,
+    // The table's base ROOM_CHARGE. The server adds it to service_charge on its
+    // own; only used so the offline copy of the order shows the same total.
+    double roomChargeRate = 0.0,
   }) async {
     // The creating account's floor ('gf' / '2f', null if unscoped) is stamped
     // on the order so each floor's staff only see their own floor's orders.
@@ -850,7 +1032,8 @@ class ApiService {
         'status': 3, // PENDING
         'subtotal': subtotal,
         'tax_amount': taxAmount,
-        'service_charge': serviceCharge,
+        'service_charge': roomChargeRate + serviceCharge,
+        if (roomChargeRate > 0) 'room_charge': roomChargeRate,
         'discount_amount': discountAmount,
         'grand_total': grandTotal,
         'encoded_dt': DateTime.now().toIso8601String(),

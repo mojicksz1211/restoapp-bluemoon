@@ -106,6 +106,10 @@ class OfflineSyncService {
 
   // In-memory action queue
   final List<OfflineAction> _queue = [];
+
+  /// Actions done on this device that haven't reached the server yet, oldest
+  /// first (the cashier's Activity tab lists them as "Not synced yet").
+  List<OfflineAction> get pendingActions => List.unmodifiable(_queue);
   bool _initialized = false;
   bool _isSyncing = false;
   Timer? _healthProbeTimer;
@@ -651,9 +655,29 @@ class OfflineSyncService {
   }
 
   /// Transfer table in local cache
-  Future<void> transferLocalTableOrder(int orderId, int targetTableId) async {
+  /// Moves the cached order to [targetTableId]. [serverResult] (the server's
+  /// transfer response) carries the new room charge; offline, it is worked out
+  /// here the same way the server does — the room being left billed for
+  /// [prevRoomHours], the new room starting with [newRoomHours] (default 1).
+  Future<void> transferLocalTableOrder(
+    int orderId,
+    int targetTableId, {
+    Map<String, dynamic>? serverResult,
+    double? prevRoomHours,
+    double? newRoomHours,
+    bool carryOverTime = false,
+    String? transferredAt,
+  }) async {
     final orders = (await getCachedOrders()) ?? [];
     int? oldTableId;
+    final tables = (await getCachedTables()) ?? [];
+    Map<String, dynamic>? tableById(int? id) {
+      if (id == null) return null;
+      for (final t in tables) {
+        if ((t['id'] ?? t['IDNo'] as num?)?.toInt() == id) return t;
+      }
+      return null;
+    }
 
     for (int i = 0; i < orders.length; i++) {
       final o = orders[i];
@@ -661,7 +685,34 @@ class OfflineSyncService {
       if (id == orderId) {
         final updated = Map<String, dynamic>.from(o);
         oldTableId = (updated['table_id'] as num?)?.toInt();
+        final target = tableById(targetTableId);
+        final newRate = (target?['room_charge'] as num?)?.toDouble() ?? 0.0;
         updated['table_id'] = targetTableId;
+        if (target?['table_number'] != null) updated['table_number'] = target!['table_number'];
+        updated['room_charge'] = newRate;
+
+        if (serverResult != null && serverResult['service_charge'] != null) {
+          updated['service_charge'] = serverResult['service_charge'];
+          if (serverResult['grand_total'] != null) updated['grand_total'] = serverResult['grand_total'];
+          if (serverResult['room_charges'] is List) updated['room_charges'] = serverResult['room_charges'];
+        } else {
+          final oldRate = (tableById(oldTableId)?['room_charge'] as num?)?.toDouble() ?? 0.0;
+          if (oldRate > 0 || newRate > 0) {
+            _applyLocalRoomTransfer(
+              updated,
+              oldTableId: oldTableId,
+              oldTableNumber: o['table_number']?.toString(),
+              oldRate: oldRate,
+              targetTableId: targetTableId,
+              targetTableNumber: target?['table_number']?.toString(),
+              newRate: newRate,
+              prevRoomHours: prevRoomHours,
+              newRoomHours: newRoomHours,
+              carryOverTime: carryOverTime,
+              transferredAt: transferredAt,
+            );
+          }
+        }
         orders[i] = updated;
         break;
       }
@@ -675,15 +726,152 @@ class OfflineSyncService {
     await updateLocalTableStatus(targetTableId, 2);
   }
 
+  static String _sqlOf(DateTime n) {
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${n.year}-${two(n.month)}-${two(n.day)} ${two(n.hour)}:${two(n.minute)}:${two(n.second)}';
+  }
+
+  /// Current Asia/Manila time as 'YYYY-MM-DD HH:MM:SS' (the shape room-charge
+  /// times use), whatever the tablet's own timezone.
+  static String manilaNowSql() => _sqlOf(DateTime.now().toUtc().add(const Duration(hours: 8)));
+
+  /// When a cached order was taken, in Manila time: from its order number
+  /// (ORD-YYYYMMDD-HHMMSS), else its encoded_dt; null when unknown.
+  static String? _orderStartSql(Map<String, dynamic> order) {
+    final m = RegExp(r'(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})')
+        .firstMatch(order['order_no']?.toString() ?? '');
+    if (m != null) {
+      return '${m.group(1)}-${m.group(2)}-${m.group(3)} ${m.group(4)}:${m.group(5)}:${m.group(6)}';
+    }
+    final dt = DateTime.tryParse(order['encoded_dt']?.toString() ?? '');
+    if (dt == null) return null;
+    return _sqlOf(dt.toUtc().add(const Duration(hours: 8)));
+  }
+
+  static double _roundHours(double v) => v > 0 ? (v * 2).round() / 2 : 0;
+
+  /// Offline mirror of the server's transfer room-charge rule on a cached
+  /// order map (see ApiController.transferTableOrder): closes the current
+  /// room's `room_charges` entry and opens one for the new room.
+  void _applyLocalRoomTransfer(
+    Map<String, dynamic> order, {
+    required int? oldTableId,
+    required String? oldTableNumber,
+    required double oldRate,
+    required int targetTableId,
+    required String? targetTableNumber,
+    required double newRate,
+    double? prevRoomHours,
+    double? newRoomHours,
+    bool carryOverTime = false,
+    String? transferredAt,
+  }) {
+    double numOf(dynamic v) => (v as num?)?.toDouble() ?? double.tryParse(v?.toString() ?? '') ?? 0.0;
+    final serviceCharge = numOf(order['service_charge']);
+    final nowSql = transferredAt ?? manilaNowSql();
+    final segments = order['room_charges'] is List
+        ? (order['room_charges'] as List).whereType<Map>().map((s) => Map<String, dynamic>.from(s)).toList()
+        : <Map<String, dynamic>>[];
+    if (segments.isEmpty && oldRate > 0) {
+      final hours = _roundHours(serviceCharge / oldRate);
+      segments.add({
+        'table_id': oldTableId,
+        'table_number': oldTableNumber,
+        'rate': oldRate,
+        'hours': hours,
+        'amount': oldRate * hours,
+        // An order taken offline has no history yet: its room clock started
+        // when the order was taken (kept if the time carries over below).
+        'started_at': _orderStartSql(order),
+        'ended_at': null,
+        'minutes_used': 0,
+        'active': true,
+      });
+    }
+    final before = segments.fold<double>(0, (sum, s) => sum + numOf(s['amount']));
+    final other = math.max(0.0, serviceCharge - before);
+    // Carried over (moved before 30 minutes): the new room keeps the old clock.
+    String? carriedStart;
+    for (final s in segments) {
+      if (s['active'] != true) continue;
+      if (carryOverTime) carriedStart = s['started_at']?.toString();
+      final hours = _roundHours(prevRoomHours ?? numOf(s['hours']));
+      s['hours'] = hours;
+      s['amount'] = numOf(s['rate']) * hours;
+      s['ended_at'] = nowSql;
+      s['active'] = false;
+    }
+    if (newRate > 0) {
+      final hours = _roundHours(newRoomHours ?? 1);
+      segments.add({
+        'table_id': targetTableId,
+        'table_number': targetTableNumber,
+        'rate': newRate,
+        'hours': hours,
+        'amount': newRate * hours,
+        'started_at': carriedStart ?? nowSql,
+        'ended_at': null,
+        'minutes_used': 0,
+        'active': true,
+      });
+    }
+    final newService = segments.fold<double>(0, (sum, s) => sum + numOf(s['amount'])) + other;
+    order['room_charges'] = segments;
+    order['service_charge'] = newService;
+    order['grand_total'] = numOf(order['subtotal']) +
+        numOf(order['tax_amount']) +
+        newService -
+        numOf(order['discount_amount']);
+  }
+
   /// Extend room charge in local cache. `qty` is in 0.5 steps, matching
   /// admin's manual-order room charge stepper.
-  Future<void> extendLocalRoomCharge(int orderId, {double qty = 1.0}) async {
+  /// Adds [qty] room-charge sessions to the cached order — or, with
+  /// [sessions], sets its room charge to that many in total (0 = waived).
+  /// With room-charge history (`room_charges`) only the current room changes.
+  /// [serverResult] (the server's response) is used as-is when given.
+  Future<void> extendLocalRoomCharge(
+    int orderId, {
+    double qty = 1.0,
+    double? sessions,
+    Map<String, dynamic>? serverResult,
+  }) async {
     final orders = (await getCachedOrders()) ?? [];
     for (int i = 0; i < orders.length; i++) {
       final o = orders[i];
       final id = (o['order_id'] ?? o['IDNo'] ?? o['id'] as num?)?.toInt();
       if (id == orderId) {
         final updated = Map<String, dynamic>.from(o);
+        if (serverResult != null && serverResult['service_charge'] != null) {
+          updated['service_charge'] = serverResult['service_charge'];
+          if (serverResult['grand_total'] != null) updated['grand_total'] = serverResult['grand_total'];
+          if (serverResult['room_charges'] is List) updated['room_charges'] = serverResult['room_charges'];
+          orders[i] = updated;
+          break;
+        }
+        final segments = updated['room_charges'] is List
+            ? (updated['room_charges'] as List).whereType<Map>().map((s) => Map<String, dynamic>.from(s)).toList()
+            : <Map<String, dynamic>>[];
+        final activeIndex = segments.lastIndexWhere((s) => s['active'] == true);
+        if (activeIndex >= 0) {
+          double numOf(dynamic v) => (v as num?)?.toDouble() ?? double.tryParse(v?.toString() ?? '') ?? 0.0;
+          final currentService = numOf(updated['service_charge']);
+          final before = segments.fold<double>(0, (sum, s) => sum + numOf(s['amount']));
+          final other = math.max(0.0, currentService - before);
+          final active = segments[activeIndex];
+          final hours = _roundHours(sessions ?? (numOf(active['hours']) + qty));
+          active['hours'] = hours;
+          active['amount'] = numOf(active['rate']) * hours;
+          final newService = segments.fold<double>(0, (sum, s) => sum + numOf(s['amount'])) + other;
+          updated['room_charges'] = segments;
+          updated['service_charge'] = newService;
+          updated['grand_total'] = numOf(updated['subtotal']) +
+              numOf(updated['tax_amount']) +
+              newService -
+              numOf(updated['discount_amount']);
+          orders[i] = updated;
+          break;
+        }
         final tableId = (updated['table_id'] as num?)?.toInt();
         double roomCharge = 0.0;
         if (tableId != null) {
@@ -696,7 +884,9 @@ class OfflineSyncService {
         }
 
         final currentService = (updated['service_charge'] as num?)?.toDouble() ?? 0.0;
-        final newService = currentService + (roomCharge * qty);
+        final newService = sessions != null && roomCharge > 0
+            ? roomCharge * sessions
+            : currentService + (roomCharge * qty);
         updated['service_charge'] = newService;
 
         final subtotal = (updated['subtotal'] as num?)?.toDouble() ?? 0.0;
@@ -841,6 +1031,14 @@ class OfflineSyncService {
     await _flushQueue();
   }
 
+  /// A queued action's request body, plus when it was really done
+  /// (`client_at`, Manila time) — the server's activity log then shows the
+  /// original time instead of the sync time.
+  static Map<String, dynamic> _syncBody(OfflineAction action) => {
+        ...action.payload,
+        'client_at': _sqlOf(action.createdAt.toUtc().add(const Duration(hours: 8))),
+      };
+
   Future<bool> _executeSyncAction({
     required OfflineAction action,
     required String baseUrl,
@@ -856,7 +1054,7 @@ class OfflineSyncService {
     switch (action.type) {
       case 'create_order':
         final url = Uri.parse('$baseUrl/api/orders');
-        final body = Map<String, dynamic>.from(action.payload);
+        final body = _syncBody(action);
 
         final response = await http
             .post(url, headers: headers, body: jsonEncode(body))
@@ -888,7 +1086,7 @@ class OfflineSyncService {
 
       case 'update_status':
         final url = Uri.parse('$baseUrl/api/waiter/orders/$targetOrderId/status');
-        final body = Map<String, dynamic>.from(action.payload);
+        final body = _syncBody(action);
 
         final response = await http
             .patch(url, headers: headers, body: jsonEncode(body))
@@ -902,7 +1100,7 @@ class OfflineSyncService {
 
       case 'add_items':
         final url = Uri.parse('$baseUrl/api/orders/$targetOrderId/items');
-        final body = Map<String, dynamic>.from(action.payload);
+        final body = _syncBody(action);
 
         final response = await http
             .post(url, headers: headers, body: jsonEncode(body))
@@ -916,7 +1114,7 @@ class OfflineSyncService {
 
       case 'transfer_table':
         final url = Uri.parse('$baseUrl/api/waiter/orders/$targetOrderId/transfer-table');
-        final body = Map<String, dynamic>.from(action.payload);
+        final body = _syncBody(action);
 
         final response = await http
             .post(url, headers: headers, body: jsonEncode(body))
@@ -930,7 +1128,7 @@ class OfflineSyncService {
 
       case 'extend_room_charge':
         final url = Uri.parse('$baseUrl/api/waiter/orders/$targetOrderId/extend-room-charge');
-        final body = Map<String, dynamic>.from(action.payload);
+        final body = _syncBody(action);
 
         final response = await http
             .post(url, headers: headers, body: jsonEncode(body))

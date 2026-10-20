@@ -33,6 +33,27 @@ void playNotificationChime() {
   } catch (_) {}
 }
 
+void speakOncePlatform(String text, {String? resumeLoopText}) {
+  // Pause a running repeating announcement (its loop would cut this off).
+  stopRepeatingPlatformAlert();
+  final loopId = _activeLoopId;
+  () async {
+    try {
+      await _initTtsIfNeeded();
+      playNotificationChime();
+      await Future.delayed(const Duration(milliseconds: 350));
+      await _flutterTts.speak(text);
+    } catch (e) {
+      debugPrint('Error in TTS announcement: $e');
+    }
+    // Pick the paused loop up again, unless something else started or
+    // stopped an announcement meanwhile.
+    if (resumeLoopText != null && _activeLoopId == loopId) {
+      startRepeatingPlatformAlert(resumeLoopText);
+    }
+  }();
+}
+
 void startRepeatingPlatformAlert(String text, {int intervalMs = 5500}) {
   stopRepeatingPlatformAlert();
   final currentLoopId = ++_activeLoopId;

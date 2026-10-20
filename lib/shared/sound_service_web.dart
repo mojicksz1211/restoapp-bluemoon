@@ -15,6 +15,19 @@ void playNotificationChime() {
   } catch (_) {}
 }
 
+@JS('speakOnceAnnouncement')
+external void _speakOnceAnnouncement(JSString text);
+
+/// index.html's speakOnceAnnouncement pauses and resumes a running repeating
+/// announcement itself, so [resumeLoopText] isn't needed here.
+void speakOncePlatform(String text, {String? resumeLoopText}) {
+  try {
+    _speakOnceAnnouncement(text.toJS);
+  } catch (_) {
+    playNotificationChime();
+  }
+}
+
 void startRepeatingPlatformAlert(String text, {int intervalMs = 5500}) {
   try {
     _startRepeatingOrderAlert(text.toJS, intervalMs.toJS);

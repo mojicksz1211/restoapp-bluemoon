@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../services/settlement_dialog_service.dart';
 import 'settlement_dialog.dart';
+import '../../shared/widgets/blurred_dialog.dart';
 
 class SettlementDialogListener extends StatefulWidget {
   final Widget child;
@@ -46,9 +47,10 @@ class _SettlementDialogListenerState extends State<SettlementDialogListener> {
       return;
     }
 
-    await showDialog<void>(
-      context: navigator.context,
+    await showBlurredDialog<void>(
+      navigator.context,
       barrierDismissible: false,
+      useRootNavigator: false,
       builder: (context) {
         return SettlementDialog(
           order: order,

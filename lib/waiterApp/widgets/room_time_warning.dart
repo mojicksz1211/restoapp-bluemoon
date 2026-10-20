@@ -184,7 +184,7 @@ class _RoomTimeWarningDialogState extends State<_RoomTimeWarningDialog>
         padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 380),
-          child: Material(
+          child: SingleChildScrollView(clipBehavior: Clip.none, child: Material(
             color: Colors.transparent,
             child: Container(
               padding: const EdgeInsets.fromLTRB(24, 26, 24, 22),
@@ -354,7 +354,7 @@ class _RoomTimeWarningDialogState extends State<_RoomTimeWarningDialog>
                 ],
               ),
             ),
-          ),
+          ),),
         ),
       ),
     );

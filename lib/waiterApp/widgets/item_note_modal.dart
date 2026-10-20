@@ -72,7 +72,7 @@ Future<void> showItemNoteModal({
             ),
             child: SafeArea(
               top: false,
-              child: Padding(
+              child: SingleChildScrollView(child: Padding(
                 padding: EdgeInsets.fromLTRB(
                   isMobile ? 18 : 24,
                   14,
@@ -324,7 +324,7 @@ Future<void> showItemNoteModal({
                     ),
                   ],
                 ),
-              ),
+              ),),
             ),
           );
         },

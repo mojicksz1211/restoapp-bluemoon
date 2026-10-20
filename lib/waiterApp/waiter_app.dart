@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'widgets/settlement_dialog_listener.dart';
 import 'services/notification_service.dart';
 import 'home_page.dart';
+import '../shared/responsive.dart';
 
 final GlobalKey<NavigatorState> waiterNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -67,9 +68,11 @@ class _WaiterAppState extends State<WaiterApp> {
         ),
       ),
       builder: (context, child) {
-        return SettlementDialogListener(
-          navigatorKey: waiterNavigatorKey,
-          child: child ?? const SizedBox.shrink(),
+        return ResponsiveScope(
+          child: SettlementDialogListener(
+            navigatorKey: waiterNavigatorKey,
+            child: child ?? const SizedBox.shrink(),
+          ),
         );
       },
       home: const WaiterHomePage(),

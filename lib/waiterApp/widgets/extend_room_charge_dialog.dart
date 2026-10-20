@@ -308,7 +308,7 @@ class _ExtendDialogShell extends StatelessWidget {
       insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 380),
-        child: Container(
+        child: SingleChildScrollView(clipBehavior: Clip.none, child: Container(
           padding: const EdgeInsets.fromLTRB(24, 26, 24, 22),
           decoration: BoxDecoration(
             color: Colors.white,
@@ -422,7 +422,7 @@ class _ExtendDialogShell extends StatelessWidget {
               ),
             ],
           ),
-        ),
+        ),),
       ),
     );
   }

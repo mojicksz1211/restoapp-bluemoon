@@ -8,6 +8,7 @@ import '../../shared/offline_sync_service.dart';
 import '../../waiterApp/models.dart' show formatPrice;
 import '../../waiterApp/services/api_service.dart';
 import '../../waiterApp/waiter_models.dart' show formatClock, formatRoomHours;
+import '../../shared/responsive.dart';
 
 const _navy = Color(0xFF0C0E2B);
 const _navy2 = Color(0xFF1B1E4A);
@@ -509,12 +510,16 @@ class _ActivityLogViewState extends State<ActivityLogView> {
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.fromLTRB(20, 4, 20, 100),
         itemCount: shown.length,
-        itemBuilder: (context, i) => _ActivityCard(
-          entry: shown[i],
-          expanded: _expanded.contains(shown[i].id),
-          onTap: () => setState(() {
-            if (!_expanded.remove(shown[i].id)) _expanded.add(shown[i].id);
-          }),
+        // Capped + centered so rows don't stretch across a landscape tablet.
+        itemBuilder: (context, i) => MaxWidthBox(
+          maxWidth: 960,
+          child: _ActivityCard(
+            entry: shown[i],
+            expanded: _expanded.contains(shown[i].id),
+            onTap: () => setState(() {
+              if (!_expanded.remove(shown[i].id)) _expanded.add(shown[i].id);
+            }),
+          ),
         ),
       ),
     );

@@ -5,6 +5,7 @@ import '../shared/settings_sheet.dart';
 import '../shared/app_translations.dart';
 import 'pages/menu_home_page.dart';
 import 'services/api_service.dart';
+import '../shared/responsive.dart';
 
 class HomePage extends StatelessWidget {
   const HomePage({super.key});
@@ -61,14 +62,15 @@ class HomePage extends StatelessWidget {
                   ),
                 ),
               ),
+              // Glow sized off the screen (420px on the target tablet).
               Positioned(
-                top: -80,
+                top: -size.shortestSide * 0.1,
                 left: 0,
                 right: 0,
                 child: Center(
                   child: Container(
-                    width: 420,
-                    height: 420,
+                    width: size.shortestSide * 0.525,
+                    height: size.shortestSide * 0.525,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
                       gradient: RadialGradient(
@@ -119,7 +121,8 @@ class HomePage extends StatelessWidget {
                         const SizedBox(height: 32),
                         Center(
                           child: SizedBox(
-                            width: size.width * 0.5,
+                            // Half the screen, capped so it doesn't stretch in landscape.
+                            width: (size.width * 0.5).clamp(0.0, Responsive.formMaxWidth),
                             child: ElevatedButton(
                               onPressed: () {
                                 Navigator.pushReplacement(
@@ -210,7 +213,8 @@ class HomePage extends StatelessWidget {
                         const SizedBox(height: 24),
                         Center(
                           child: SizedBox(
-                            width: size.width * 0.5,
+                            // Half the screen, capped so it doesn't stretch in landscape.
+                            width: (size.width * 0.5).clamp(0.0, Responsive.formMaxWidth),
                             child: ElevatedButton(
                               onPressed: () {
                                 Navigator.pushReplacement(

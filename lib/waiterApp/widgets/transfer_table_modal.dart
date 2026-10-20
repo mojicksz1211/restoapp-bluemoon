@@ -384,8 +384,10 @@ class _TransferTableSheetState extends State<_TransferTableSheet> {
                         14,
                       ),
                       shrinkWrap: true,
-                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: isMobile ? 3 : 5,
+                      // Tile-width based instead of a fixed 3/5 so the column
+                      // count follows the sheet width in either orientation.
+                      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: 130,
                         crossAxisSpacing: 8,
                         mainAxisSpacing: 8,
                         childAspectRatio: 1.15,

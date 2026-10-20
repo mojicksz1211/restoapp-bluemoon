@@ -6,6 +6,7 @@ import '../services/socket_service.dart';
 import '../services/api_service.dart';
 import '../services/settlement_dialog_service.dart';
 import '../models.dart';
+import '../../shared/responsive.dart';
 
 class CartSidePanel extends StatefulWidget {
   final List<CartItem> cart;
@@ -1557,7 +1558,7 @@ class _Header extends StatelessWidget {
                   animation: cartShake!,
                   builder: (context, child) {
                     return Transform.translate(
-                      offset: Offset(cartShake!.value, 0),
+                      offset: Offset(cartShake!.value * Responsive.scaleOf(context), 0),
                       child: child,
                     );
                   },

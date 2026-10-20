@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'home_page.dart';
+import '../shared/responsive.dart';
 
 final GlobalKey<NavigatorState> cashierNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -51,6 +52,8 @@ class CashierApp extends StatelessWidget {
           ),
         ),
       ),
+      builder: (context, child) =>
+          ResponsiveScope(child: child ?? const SizedBox.shrink()),
       home: const CashierHomePage(),
     );
   }

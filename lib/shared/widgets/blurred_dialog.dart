@@ -73,12 +73,16 @@ class _BlurredBottomSheetRoute<T> extends ModalBottomSheetRoute<T> {
         IgnorePointer(
           child: AnimatedBuilder(
             animation: anim,
-            builder: (_, _) => BackdropFilter(
-              filter: ImageFilter.blur(
-                sigmaX: _blurSigma * anim.value,
-                sigmaY: _blurSigma * anim.value,
+            // ClipRect bounds the blur to this layer instead of letting the
+            // GPU sample the whole backdrop on high-res tablet screens.
+            builder: (_, _) => ClipRect(
+              child: BackdropFilter(
+                filter: ImageFilter.blur(
+                  sigmaX: _blurSigma * anim.value,
+                  sigmaY: _blurSigma * anim.value,
+                ),
+                child: const SizedBox.expand(),
               ),
-              child: const SizedBox.expand(),
             ),
           ),
         ),
@@ -114,13 +118,15 @@ Future<T?> showBlurredDialog<T>(
           // (which handles barrierDismissible).
           Positioned.fill(
             child: IgnorePointer(
-              child: BackdropFilter(
-                filter: ImageFilter.blur(
-                  sigmaX: 8 * fade.value,
-                  sigmaY: 8 * fade.value,
-                ),
-                child: ColoredBox(
-                  color: Colors.black.withValues(alpha: 0.35 * fade.value),
+              child: ClipRect(
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(
+                    sigmaX: 8 * fade.value,
+                    sigmaY: 8 * fade.value,
+                  ),
+                  child: ColoredBox(
+                    color: Colors.black.withValues(alpha: 0.35 * fade.value),
+                  ),
                 ),
               ),
             ),

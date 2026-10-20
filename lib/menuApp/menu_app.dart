@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'home_page.dart';
 import 'widgets/settlement_dialog_listener.dart';
+import '../shared/responsive.dart';
 
 final GlobalKey<NavigatorState> menuNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -53,9 +54,11 @@ class MenuApp extends StatelessWidget {
         ),
       ),
       builder: (context, child) {
-        return SettlementDialogListener(
-          navigatorKey: menuNavigatorKey,
-          child: child ?? const SizedBox.shrink(),
+        return ResponsiveScope(
+          child: SettlementDialogListener(
+            navigatorKey: menuNavigatorKey,
+            child: child ?? const SizedBox.shrink(),
+          ),
         );
       },
       home: const HomePage(),

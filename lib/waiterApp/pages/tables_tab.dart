@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../shared/widgets/card_cancel_button.dart';
@@ -313,6 +315,10 @@ class TablesTab extends StatelessWidget {
         return LayoutBuilder(
           builder: (context, constraints) {
             final width = constraints.maxWidth;
+            final textGrow = math.max(
+              1.0,
+              MediaQuery.textScalerOf(context).scale(10) / 10,
+            );
             final crossAxisCount = width > 1150
                 ? 5
                 : width > 850
@@ -331,8 +337,10 @@ class TablesTab extends StatelessWidget {
                 crossAxisCount: crossAxisCount,
                 crossAxisSpacing: 12,
                 mainAxisSpacing: 12,
-                mainAxisExtent: (anyExtendable ? 300 : 255) +
-                    (anyPendingCart ? 58 : 0),
+                // Grows with the text scale so larger text never overflows.
+                mainAxisExtent: ((anyExtendable ? 336 : 256) +
+                        (anyPendingCart ? 58 : 0)) *
+                    textGrow,
               ),
               itemBuilder: (context, index) {
                 final table = sortedTables[index];
@@ -417,6 +425,11 @@ class _TableCard extends StatelessWidget {
   static const _navy = Color(0xFF0C0E2B);
   static const _navyLight = Color(0xFF1B1E4A);
   static const _gold = Color(0xFFE8C468);
+  static const _muted = Color(0xFFA9ACCB);
+  static const _mint = Color(0xFF7DD3A8);
+
+  // Lifts a status color (Colors.green/orange/red…) so it reads on navy.
+  static Color _bright(Color c) => Color.lerp(c, Colors.white, 0.22)!;
 
   @override
   Widget build(BuildContext context) {
@@ -444,6 +457,16 @@ class _TableCard extends StatelessWidget {
         ? rawName.substring(5).trim()
         : rawName;
 
+    final accent = _bright(statusInfo.color);
+    final orderAccent = _bright(orderStatusInfo.color);
+    final showCountdown = activeOrder != null &&
+        RoomCountdown.of(activeOrder, fallbackRate: table.roomCharge) != null;
+    final subtitle = table.hasRoomCharge
+        // Whole-peso rates drop the .00 so the rate fits on narrow cards.
+        ? '₱${formatPrice(table.roomCharge).replaceAll(RegExp(r'\.00$'), '')} / hr'
+        : (table.capacity > 0 ? '${table.capacity} seats' : 'Table');
+    final itemCount = activeOrder?.items.length ?? 0;
+
     return Stack(
       clipBehavior: Clip.none,
       children: [
@@ -454,280 +477,333 @@ class _TableCard extends StatelessWidget {
           ),
           child: Material(
       color: Colors.transparent,
-      borderRadius: BorderRadius.circular(16),
+      borderRadius: BorderRadius.circular(18),
       child: InkWell(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(18),
         onTap: isAvailable ? () => onGetOrder(table) : () => onViewDetails(table),
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(18),
             gradient: const LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [_navy, _navyLight],
+              colors: [_navyLight, _navy],
             ),
-            border: Border.all(color: _gold.withValues(alpha: 0.25), width: 1),
+            border: Border.all(
+              color: accent.withValues(alpha: activeOrder != null ? 0.5 : 0.22),
+              width: activeOrder != null ? 1.4 : 1,
+            ),
             boxShadow: [
               BoxShadow(
-                color: _navy.withValues(alpha: 0.25),
-                blurRadius: 16,
+                color: _navy.withValues(alpha: 0.22),
+                blurRadius: 18,
                 offset: const Offset(0, 8),
               ),
             ],
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          'TABLE',
-                          style: GoogleFonts.urbanist(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1.2,
-                            color: _gold,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        FittedBox(
-                          fit: BoxFit.scaleDown,
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            cleanTableName,
-                            maxLines: 1,
-                            style: GoogleFonts.urbanist(
-                              fontSize: 18.5,
-                              fontWeight: FontWeight.w900,
-                              color: Colors.white,
-                              letterSpacing: 0.2,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
-                    decoration: BoxDecoration(
-                      color: statusInfo.color.withValues(alpha: 0.18),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: statusInfo.color.withValues(alpha: 0.6)),
-                    ),
-                    child: Text(
-                      statusInfo.label,
-                      style: GoogleFonts.urbanist(
-                        fontSize: 12.0,
-                        fontWeight: FontWeight.w800,
-                        color: statusInfo.color,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              if (activeOrder != null) ...[
-                const SizedBox(height: 8),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: OfflineOrderBadge(orderId: activeOrder.id),
-                ),
-              ],
-              const SizedBox(height: 10),
-              if (hasPendingCart) ...[
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                  decoration: BoxDecoration(
-                    color: _gold.withValues(alpha: 0.16),
-                    borderRadius: BorderRadius.circular(9),
-                    border: Border.all(color: _gold.withValues(alpha: 0.55)),
-                  ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(17),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(14),
                   child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      // Header: name + status pill on one line, then the room
+                      // rate / seats at full width.
                       Row(
-                        mainAxisSize: MainAxisSize.min,
-                        mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          const Icon(Icons.shopping_cart_rounded, size: 15, color: _gold),
-                          const SizedBox(width: 6),
-                          Text(
-                            'Unplaced Order',
-                            style: GoogleFonts.urbanist(
-                              fontSize: 13.5,
-                              fontWeight: FontWeight.w900,
-                              color: _gold,
+                          Expanded(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                cleanTableName,
+                                maxLines: 1,
+                                style: GoogleFonts.urbanist(
+                                  fontSize: 19,
+                                  fontWeight: FontWeight.w900,
+                                  color: Colors.white,
+                                  height: 1.15,
+                                ),
+                              ),
                             ),
                           ),
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: accent.withValues(alpha: 0.14),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  width: 7,
+                                  height: 7,
+                                  decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
+                                ),
+                                const SizedBox(width: 5),
+                                Text(
+                                  statusInfo.label,
+                                  style: GoogleFonts.urbanist(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w800,
+                                    color: accent,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          // Room for the cancel X on the top-right corner.
+                          if (activeOrder != null && onCancelOrder != null)
+                            const SizedBox(width: 14),
                         ],
                       ),
                       const SizedBox(height: 3),
-                      FittedBox(
-                        fit: BoxFit.scaleDown,
-                        alignment: Alignment.center,
-                        child: Text(
-                          '$cartPendingCount item${cartPendingCount == 1 ? '' : 's'} · ₱${formatPrice(cartPendingTotal)}',
-                          maxLines: 1,
-                          style: GoogleFonts.urbanist(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w800,
-                            color: _gold,
+                      Text(
+                        subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.urbanist(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: table.hasRoomCharge ? _gold : _muted,
+                        ),
+                      ),
+                      if (activeOrder != null) ...[
+                        const SizedBox(height: 8),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: OfflineOrderBadge(orderId: activeOrder.id),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      if (hasPendingCart) ...[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: _gold.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: _gold.withValues(alpha: 0.45)),
+                          ),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.shopping_cart_rounded, size: 17, color: _gold),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      'Unplaced Order',
+                                      maxLines: 1,
+                                      style: GoogleFonts.urbanist(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w900,
+                                        color: _gold,
+                                      ),
+                                    ),
+                                    FittedBox(
+                                      fit: BoxFit.scaleDown,
+                                      alignment: Alignment.centerLeft,
+                                      child: Text(
+                                        '$cartPendingCount item${cartPendingCount == 1 ? '' : 's'} · ₱${formatPrice(cartPendingTotal)}',
+                                        maxLines: 1,
+                                        style: GoogleFonts.urbanist(
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w700,
+                                          color: _gold.withValues(alpha: 0.85),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 8),
-              ],
-              _InfoRow(
-                label: 'Order Status',
-                value: orderStatusInfo.label,
-                valueColor: orderStatusInfo.color,
-              ),
-              const SizedBox(height: 6),
-              if (activeOrder != null &&
-                  RoomCountdown.of(activeOrder, fallbackRate: table.roomCharge) != null)
-                Row(
-                  children: [
-                    Text(
-                      'Time Left',
-                      maxLines: 1,
-                      style: GoogleFonts.urbanist(
-                        fontSize: 14.5,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.white.withValues(alpha: 0.7),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: FittedBox(
-                        fit: BoxFit.scaleDown,
-                        alignment: Alignment.centerRight,
-                        child: RoomCountdownBadge(
-                          order: activeOrder,
-                          fallbackRate: table.roomCharge,
-                          onDark: true,
-                          dense: true,
+                        const SizedBox(height: 8),
+                      ],
+                      // Order summary panel.
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.06),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
                         ),
-                      ),
-                    ),
-                  ],
-                )
-              else
-                _InfoRow(
-                  label: 'Capacity',
-                  value: table.capacity.toString(),
-                  valueColor: Colors.white,
-                ),
-              const Spacer(),
-              const SizedBox(height: 8),
-              if (isAvailable)
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: () => onGetOrder(table),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _gold,
-                      foregroundColor: _navy,
-                      elevation: 0,
-                      padding: const EdgeInsets.symmetric(vertical: 10.5),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                    ),
-                    child: Text(
-                      actionLabel,
-                      style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 14.5),
-                    ),
-                  ),
-                )
-              else
-                Column(
-                  children: [
-                    SizedBox(
-                      width: double.infinity,
-                      child: OutlinedButton(
-                        onPressed: () => onViewDetails(table),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white,
-                          side: BorderSide(color: Colors.white.withValues(alpha: 0.35)),
-                          padding: const EdgeInsets.symmetric(vertical: 9),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        ),
-                        child: Text(
-                          actionLabel,
-                          style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 13.5),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton(
-                            onPressed: () => onEditOrder(table),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: _gold,
-                              side: BorderSide(color: _gold.withValues(alpha: 0.6)),
-                              padding: const EdgeInsets.symmetric(vertical: 9),
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  width: 7,
+                                  height: 7,
+                                  decoration: BoxDecoration(color: orderAccent, shape: BoxShape.circle),
+                                ),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    orderStatusInfo.label,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.urbanist(
+                                      fontSize: 13.5,
+                                      fontWeight: FontWeight.w800,
+                                      color: activeOrder != null ? orderAccent : _muted,
+                                    ),
+                                  ),
+                                ),
+                                if (activeOrder != null)
+                                  Text(
+                                    '₱${formatPrice(activeOrder.grandTotal)}',
+                                    maxLines: 1,
+                                    style: GoogleFonts.urbanist(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w900,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                              ],
                             ),
-                            child: Text(
-                              'Edit Order',
-                              style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 13),
+                            const SizedBox(height: 3),
+                            Text(
+                              activeOrder != null
+                                  ? '$itemCount item${itemCount == 1 ? '' : 's'} · ${activeOrder.orderNo ?? '#${activeOrder.id}'}'
+                                  : (isAvailable ? 'Ready for guests' : 'No active order'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.urbanist(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: _muted,
+                              ),
                             ),
-                          ),
+                            if (showCountdown) ...[
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  const Icon(Icons.timer_outlined, size: 15, color: _muted),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    'Time Left',
+                                    maxLines: 1,
+                                    style: GoogleFonts.urbanist(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: _muted,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: FittedBox(
+                                      fit: BoxFit.scaleDown,
+                                      alignment: Alignment.centerRight,
+                                      child: RoomCountdownBadge(
+                                        order: activeOrder,
+                                        fallbackRate: table.roomCharge,
+                                        onDark: true,
+                                        dense: true,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ],
                         ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: ElevatedButton(
-                            onPressed: () => onAddOrder(table),
+                      ),
+                      const Spacer(),
+                      const SizedBox(height: 10),
+                      if (isAvailable)
+                        SizedBox(
+                          width: double.infinity,
+                          height: 46,
+                          child: ElevatedButton.icon(
+                            onPressed: () => onGetOrder(table),
+                            icon: Icon(
+                              hasPendingCart
+                                  ? Icons.shopping_cart_checkout_rounded
+                                  : Icons.add_circle_outline_rounded,
+                              size: 19,
+                            ),
+                            label: Text(
+                              actionLabel,
+                              style: GoogleFonts.urbanist(fontWeight: FontWeight.w900, fontSize: 14.5),
+                            ),
                             style: ElevatedButton.styleFrom(
                               backgroundColor: _gold,
                               foregroundColor: _navy,
                               elevation: 0,
-                              padding: const EdgeInsets.symmetric(vertical: 9),
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                            ),
-                            child: Text(
-                              'Add Order',
-                              style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 13),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                             ),
                           ),
+                        )
+                      else ...[
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _CardAction(
+                                icon: Icons.receipt_long_rounded,
+                                label: 'Details',
+                                onTap: () => onViewDetails(table),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: _CardAction(
+                                icon: Icons.edit_rounded,
+                                label: 'Edit',
+                                onTap: () => onEditOrder(table),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: _CardAction(
+                                icon: Icons.add_rounded,
+                                label: 'Add',
+                                filled: true,
+                                onTap: () => onAddOrder(table),
+                              ),
+                            ),
+                          ],
                         ),
+                        if (showExtend) ...[
+                          const SizedBox(height: 6),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 40,
+                            child: OutlinedButton.icon(
+                              onPressed: () => onExtendRoomCharge(table),
+                              icon: const Icon(Icons.more_time_rounded, size: 17),
+                              label: Text(
+                                'Extend Room Charge',
+                                style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 13),
+                              ),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: _mint,
+                                backgroundColor: _mint.withValues(alpha: 0.08),
+                                side: BorderSide(color: _mint.withValues(alpha: 0.55)),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                            ),
+                          ),
+                        ],
                       ],
-                    ),
-                    if (showExtend) ...[
-                      const SizedBox(height: 6),
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton.icon(
-                          onPressed: () => onExtendRoomCharge(table),
-                          icon: const Icon(Icons.more_time_rounded, size: 16),
-                          label: Text(
-                            'Extend Room Charge',
-                            style: GoogleFonts.urbanist(fontWeight: FontWeight.w800, fontSize: 13),
-                          ),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xFF7DD3A8),
-                            side: const BorderSide(color: Color(0xFF7DD3A8)),
-                            padding: const EdgeInsets.symmetric(vertical: 9),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                          ),
-                        ),
-                      ),
                     ],
-                  ],
+                  ),
                 ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -746,54 +822,55 @@ class _TableCard extends StatelessWidget {
   }
 }
 
-class _InfoRow extends StatelessWidget {
+/// Icon-over-label action button for an occupied table card. [filled] is the
+/// gold primary action; the others are subtle tonal buttons.
+class _CardAction extends StatelessWidget {
+  final IconData icon;
   final String label;
-  final String value;
-  final Color? valueColor;
+  final VoidCallback onTap;
+  final bool filled;
 
-  const _InfoRow({
+  const _CardAction({
+    required this.icon,
     required this.label,
-    required this.value,
-    this.valueColor,
+    required this.onTap,
+    this.filled = false,
   });
+
+  static const _navy = Color(0xFF0C0E2B);
+  static const _gold = Color(0xFFE8C468);
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        // Only the label is flexible (Expanded). Giving both label and
-        // value a flex factor (previously Expanded + Flexible, both
-        // defaulting to flex:1) splits the row 50/50 regardless of how
-        // short the value actually is, leaving the value stranded mid-row
-        // instead of pinned to the right edge like a label/value pair
-        // should be. With just the label flexible, it eats exactly the
-        // leftover space and the value sits flush right.
-        Expanded(
-          child: Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: GoogleFonts.urbanist(
-              fontSize: 14.5,
-              fontWeight: FontWeight.w600,
-              color: Colors.white.withValues(alpha: 0.7),
-            ),
+    return Material(
+      color: filled ? _gold : Colors.white.withValues(alpha: 0.09),
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: SizedBox(
+          height: 54,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 19, color: filled ? _navy : _gold),
+              const SizedBox(height: 3),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  style: GoogleFonts.urbanist(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w800,
+                    color: filled ? _navy : Colors.white,
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
-        const SizedBox(width: 8),
-        Text(
-          value,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          textAlign: TextAlign.right,
-          style: GoogleFonts.urbanist(
-            fontSize: 15.0,
-            fontWeight: FontWeight.w800,
-            color: valueColor ?? Colors.white,
-          ),
-        ),
-      ],
+      ),
     );
   }
 }
-

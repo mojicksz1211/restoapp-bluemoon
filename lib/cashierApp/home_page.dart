@@ -36,6 +36,7 @@ import '../shared/widgets/centered_section_header.dart';
 import '../shared/widgets/sliding_segments.dart';
 import '../shared/update_dialog.dart';
 import '../shared/widgets/blurred_dialog.dart';
+import '../shared/responsive.dart';
 
 class SettlementData {
   final String paymentMethod;
@@ -1294,6 +1295,10 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       useSafeArea: true,
+      // Wider on landscape tablets so the sheet can lay out in two columns.
+      constraints: BoxConstraints(
+        maxWidth: MediaQuery.sizeOf(context).width >= 900 ? 1000 : 640,
+      ),
       builder: (context) => _SettleOrderSheet(order: order),
     );
 
@@ -2276,21 +2281,33 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
               ),
             );
           }
-          return _HistoryOrderListItem(
-            order: orders[index - 1],
-            isGroundFloor: _isGroundFloorOrder(orders[index - 1]),
+          // Capped + centered so rows don't stretch across a landscape tablet.
+          return MaxWidthBox(
+            maxWidth: 960,
+            child: _HistoryOrderListItem(
+              order: orders[index - 1],
+              isGroundFloor: _isGroundFloorOrder(orders[index - 1]),
+            ),
           );
         },
       );
     }
 
-    final screenWidth = MediaQuery.of(context).size.width;
+    final displayOrders = _filterByFloor(orders);
+
+    // Columns come from the width this list actually gets (not the raw
+    // window width), so cards stay a sane size in portrait and landscape.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+    final screenWidth = constraints.hasBoundedWidth
+        ? constraints.maxWidth
+        : MediaQuery.of(context).size.width;
     int crossAxisCount = screenWidth > 1300 ? 4 : (screenWidth > 950 ? 3 : (screenWidth > 600 ? 2 : 1));
     double spacing = 16;
     double padding = 20;
-    double cardWidth = (screenWidth - (padding * 2) - (spacing * (crossAxisCount - 1))) / crossAxisCount;
-
-    final displayOrders = _filterByFloor(orders);
+    // floorToDouble keeps rounding from pushing the last card onto a new row.
+    double cardWidth = ((screenWidth - (padding * 2) - (spacing * (crossAxisCount - 1))) / crossAxisCount)
+        .floorToDouble();
 
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 100),
@@ -2355,6 +2372,8 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
             ),
         ],
       ),
+    );
+      },
     );
   }
 
@@ -3618,9 +3637,11 @@ class _CenterOrderAlertModalState extends State<_CenterOrderAlertModal>
         children: [
           // Blurred, dimmed screen behind the alert, like the app's other popups.
           Positioned.fill(
-            child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
-              child: ColoredBox(color: Colors.black.withValues(alpha: 0.4)),
+            child: ClipRect(
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+                child: ColoredBox(color: Colors.black.withValues(alpha: 0.4)),
+              ),
             ),
           ),
           Center(
@@ -5026,13 +5047,13 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
             ),
           ),
 
-          // Scrollable Body
+          // Scrollable Body — two columns (bill | payment) when the sheet is
+          // wide enough, so a landscape tablet barely needs to scroll; one
+          // column otherwise. Same widgets and text sizes either way.
           Flexible(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final billSection = <Widget>[
                   // 1. BILL ITEMS SUMMARY
                   Text(
                     roomCharge > 0
@@ -5110,9 +5131,9 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                       ],
                     ),
                   ),
+                ];
 
-                  const SizedBox(height: 18),
-
+                final paymentSection = <Widget>[
                   // 2. PAYMENT METHOD SELECTOR
                   Text(
                     'PAYMENT METHOD',
@@ -5432,8 +5453,47 @@ class _SettleOrderSheetState extends State<_SettleOrderSheet> {
                       ),
                     ),
                   ),
-                ],
-              ),
+                ];
+
+                if (constraints.maxWidth >= 820) {
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        flex: 5,
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.fromLTRB(20, 20, 10, 20),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: billSection,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        flex: 6,
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.fromLTRB(10, 20, 20, 20),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: paymentSection,
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                }
+                return SingleChildScrollView(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      ...billSection,
+                      const SizedBox(height: 18),
+                      ...paymentSection,
+                    ],
+                  ),
+                );
+              },
             ),
           ),
 

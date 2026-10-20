@@ -86,7 +86,7 @@ class _AppSettingsSheetState extends State<_AppSettingsSheet> {
   Widget build(BuildContext context) {
     return SafeArea(
       top: false,
-      child: Padding(
+      child: SingleChildScrollView(child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -205,7 +205,7 @@ class _AppSettingsSheetState extends State<_AppSettingsSheet> {
               ),
           ],
         ),
-      ),
+      ),),
     );
   }
 }

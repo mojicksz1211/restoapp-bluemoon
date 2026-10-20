@@ -121,13 +121,15 @@ class _FloatingResultState extends State<_FloatingResult>
               onTap: _close,
               child: AnimatedBuilder(
                 animation: fade,
-                builder: (context, _) => BackdropFilter(
-                  filter: ImageFilter.blur(
-                    sigmaX: 8 * fade.value,
-                    sigmaY: 8 * fade.value,
-                  ),
-                  child: ColoredBox(
-                    color: Colors.black.withValues(alpha: 0.35 * fade.value),
+                builder: (context, _) => ClipRect(
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(
+                      sigmaX: 8 * fade.value,
+                      sigmaY: 8 * fade.value,
+                    ),
+                    child: ColoredBox(
+                      color: Colors.black.withValues(alpha: 0.35 * fade.value),
+                    ),
                   ),
                 ),
               ),

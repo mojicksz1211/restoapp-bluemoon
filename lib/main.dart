@@ -14,6 +14,7 @@ import 'shared/offline_sync_service.dart';
 import 'shared/lan_broadcast_service.dart';
 import 'shared/background_service.dart';
 import 'shared/session_presence.dart';
+import 'shared/responsive.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -119,6 +120,7 @@ class RootAppState extends State<RootApp> {
       return MaterialApp(
         debugShowCheckedModeBanner: false,
         theme: _buildTheme(),
+        builder: _responsiveBuilder,
         home: Scaffold(
           backgroundColor: const Color(0xFFF5F6F0),
           body: Center(
@@ -133,6 +135,7 @@ class RootAppState extends State<RootApp> {
         title: 'Blue Moon Staff App',
         debugShowCheckedModeBanner: false,
         theme: _buildTheme(),
+        builder: _responsiveBuilder,
         home: LoginPage(
           onLoginSuccess: (context, permissions, role) {
             final pId = int.tryParse(permissions ?? '');
@@ -161,13 +164,16 @@ class RootAppState extends State<RootApp> {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: _buildTheme(),
+      builder: _responsiveBuilder,
       home: Scaffold(
         backgroundColor: const Color(0xFFF5F6F0),
         body: SafeArea(
-          child: Center(
+          child: OverflowSafeScroll(
+            child: Center(
             child: Padding(
               padding: const EdgeInsets.all(24),
               child: Column(
+                mainAxisSize: MainAxisSize.min,
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Image.asset(
@@ -218,10 +224,14 @@ class RootAppState extends State<RootApp> {
               ),
             ),
           ),
+          ),
         ),
       ),
     );
   }
+
+  Widget _responsiveBuilder(BuildContext context, Widget? child) =>
+      ResponsiveScope(child: child ?? const SizedBox.shrink());
 
   ThemeData _buildTheme() {
     return ThemeData(

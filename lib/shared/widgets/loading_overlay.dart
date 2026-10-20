@@ -29,13 +29,15 @@ void showLoadingDialog(BuildContext context, String message) {
       return Stack(
         children: [
           Positioned.fill(
-            child: BackdropFilter(
-              filter: ImageFilter.blur(
-                sigmaX: 8 * fade.value,
-                sigmaY: 8 * fade.value,
-              ),
-              child: ColoredBox(
-                color: Colors.black.withValues(alpha: 0.35 * fade.value),
+            child: ClipRect(
+              child: BackdropFilter(
+                filter: ImageFilter.blur(
+                  sigmaX: 8 * fade.value,
+                  sigmaY: 8 * fade.value,
+                ),
+                child: ColoredBox(
+                  color: Colors.black.withValues(alpha: 0.35 * fade.value),
+                ),
               ),
             ),
           ),

@@ -391,6 +391,29 @@ Future<void> _runService(ServiceInstance service) async {
     }
   }
 
+  // Same floor rule as the home pages: the order's own floor wins, else
+  // "Room 1"-"Room 13" are 2nd floor and everything else ground floor. A
+  // floor-scoped cashier only gets its own floor's notifications.
+  bool visibleFor(dynamic floor, String? tableNumber) {
+    if (floorScope == null) return true;
+    final orderFloor = normalizeFloor(floor);
+    if (orderFloor != null) return orderFloor == floorScope;
+    final name = (tableNumber ?? '').toUpperCase().trim();
+    if (name.isEmpty) return true;
+    final room = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(name);
+    final roomNum = int.tryParse(room?.group(1) ?? '');
+    final isSecondFloor = roomNum != null && roomNum >= 1 && roomNum <= 13;
+    return floorScope == kFloorSecond ? isSecondFloor : !isSecondFloor;
+  }
+
+  bool visibleForFloor(WaiterOrder order) => visibleFor(order.floor, order.tableNumber);
+
+  bool payloadVisibleForFloor(Map<String, dynamic> data, Map<String, dynamic> orderData) =>
+      visibleFor(
+        orderData['floor'] ?? orderData['FLOOR'] ?? data['floor'],
+        (orderData['table_number'] ?? data['table_number'])?.toString(),
+      );
+
   void handleOrderCreated(Map<String, dynamic> data, String source) {
     // New-order alerts are cashier-only — waiterApp used to alert on other
     // waiters' new orders too, but that's explicitly not wanted for this
@@ -424,6 +447,7 @@ Future<void> _runService(ServiceInstance service) async {
     }
     final encodedBy = (orderData['encoded_by'] ?? data['encoded_by'])?.toString();
     if (encodedBy != null && userId != null && encodedBy == userId) return; // self-placed
+    if (!payloadVisibleForFloor(data, orderData)) return; // the other floor's order
     if (!alertedOrderIds.add(orderId)) return; // already alerted this run
     // Seed the qty baseline now — without this, the next poll tick sees
     // lastAlertedQty[orderId] as unset (null), which never equals the
@@ -460,6 +484,7 @@ Future<void> _runService(ServiceInstance service) async {
     if (source != 'POLL') {
       unawaited(OfflineSyncService.instance.upsertCachedOrder(orderData));
     }
+    if (!payloadVisibleForFloor(data, orderData)) return;
     final qty = sumQty(orderData);
     if (lastAlertedQty[orderId] == qty) return; // no real change since last alert
     lastAlertedQty[orderId] = qty;
@@ -483,6 +508,7 @@ Future<void> _runService(ServiceInstance service) async {
     if (orderId == null) return;
     final change = changeOf(data, orderData);
     if (change == null || isOwnChange(change)) return;
+    if (!payloadVisibleForFloor(data, orderData)) return;
     final type = change['type']?.toString();
     final at = change['at']?.toString() ?? '';
     if (lastChangeAt[orderId] == '$type@$at') return; // same event delivered twice
@@ -543,19 +569,6 @@ Future<void> _runService(ServiceInstance service) async {
   // skipped here (the REST order list has no reliable raw encoded_by field
   // to compare against, only a display name) — same tradeoff the existing
   // foreground poll fallback already accepts.
-  // Same floor rule as the home pages: the order's own floor wins, else
-  // "Room 1"-"Room 13" are 2nd floor and everything else ground floor.
-  bool visibleForFloor(WaiterOrder order) {
-    if (floorScope == null) return true;
-    final orderFloor = normalizeFloor(order.floor);
-    if (orderFloor != null) return orderFloor == floorScope;
-    final name = (order.tableNumber ?? '').toUpperCase().trim();
-    if (name.isEmpty) return true;
-    final room = RegExp(r'\bROOM\s*[-_]?\s*([0-9]+)\b').firstMatch(name);
-    final roomNum = int.tryParse(room?.group(1) ?? '');
-    final isSecondFloor = roomNum != null && roomNum >= 1 && roomNum <= 13;
-    return floorScope == kFloorSecond ? isSecondFloor : !isSecondFloor;
-  }
 
   // "15 minutes left" / "time is up" for rooms with a room charge — waiter and
   // cashier both. Only while the app isn't on screen (it shows its own popup
@@ -615,6 +628,7 @@ Future<void> _runService(ServiceInstance service) async {
           'order_id': order.id,
           'order_no': order.orderNo,
           'table_number': order.tableNumber,
+          'floor': order.floor,
           'items': order.items.map((it) => {'qty': it.quantity}).toList(),
         };
         if (!wasKnown) {

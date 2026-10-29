@@ -170,11 +170,15 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   List<WaiterTable> _tables = [];
   String _floorFilter = 'all'; // 'all', 'gf', '2f'
   // 'gf', '2f', or null (unscoped). Set per-account by an admin via the
-  // FLOOR column on user_info. Unlike waiterApp, this does NOT default to
-  // symmetric behavior — a branch typically wants its ground-floor cashier
-  // to settle everything (unscoped), and only a satellite floor cashier
-  // locked to just that floor's tables.
+  // FLOOR column on user_info. Alerts always follow it (_isOrderVisibleForFloorScope).
+  // Unlike waiterApp, the view is NOT symmetric — the ground-floor cashier
+  // settles everything, so a 'gf' account still sees every floor's orders and
+  // tables (with the floor chips) and only its alerts are GF-only, while a
+  // satellite floor cashier is locked to just that floor's tables.
   String? _floorScope;
+  // The floor the order list / tables / activity log are locked to: only a
+  // 2nd-floor account. Null = sees every floor.
+  String? get _viewFloorLock => _floorScope == kFloorSecond ? kFloorSecond : null;
   final Set<int> _joinedOrderIds = {};
   String _searchQuery = '';
   // Bumped whenever orders change, so the Activity tab refreshes itself.
@@ -377,8 +381,9 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
   }
 
   List<WaiterTable> _applyFloorScope(List<WaiterTable> tables) {
-    if (_floorScope != 'gf' && _floorScope != '2f') return tables;
-    final wantGf = _floorScope == 'gf';
+    final lock = _viewFloorLock;
+    if (lock == null) return tables;
+    final wantGf = lock == kFloorGround;
     return tables.where((t) => _isGroundFloorTable(t) == wantGf).toList();
   }
 
@@ -388,9 +393,8 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
     setState(() {
       _myUserId = userData['user_id']?.toString();
       _floorScope = userData['floor'];
-      if (_floorScope == 'gf' || _floorScope == '2f') {
-        _floorFilter = _floorScope!;
-      }
+      final lock = _viewFloorLock;
+      if (lock != null) _floorFilter = lock;
     });
   }
 
@@ -964,7 +968,8 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
         _updateRepeatingTtsAnnouncement();
       } else if (!isNewOrder &&
           !byMe &&
-          (eventType == 'order_items_added' || data['items_added'] != null)) {
+          (eventType == 'order_items_added' || data['items_added'] != null) &&
+          _isOrderVisibleForFloorScope(updatedOrder)) {
         final currentQty = _totalQuantity(updatedOrder);
         if (_lastAlertedItemsQty[updatedOrder.id] != currentQty) {
           _lastAlertedItemsQty[updatedOrder.id] = currentQty;
@@ -2045,7 +2050,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
                     _buildOrderList(_filterOrders(historyOrders), isHistory: true),
                     ActivityLogView(
                       searchQuery: _searchQuery,
-                      floorScope: _floorScope,
+                      floorScope: _viewFloorLock,
                       isGroundFloor: _isGroundFloorFor,
                       refreshSignal: _activitySignal,
                     ),
@@ -2314,7 +2319,7 @@ class _CashierHomePageState extends State<CashierHomePage> with WidgetsBindingOb
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (!isHistory && _floorScope == null) ...[
+          if (!isHistory && _viewFloorLock == null) ...[
             _buildFloorFilterChips(orders),
             const SizedBox(height: 16),
           ],
